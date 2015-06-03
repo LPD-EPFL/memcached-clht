@@ -36,8 +36,8 @@ struct conn_queue {
     pthread_mutex_t lock;
 };
 
-/* Lock for cache operations (item_*, assoc_*) */
-pthread_mutex_t cache_lock;
+/* Locks for cache LRU operations */
+pthread_mutex_t lru_locks[POWER_LARGEST];
 
 /* Connection lock around accepting new connections */
 pthread_mutex_t conn_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -111,17 +111,18 @@ unsigned short refcount_decr(unsigned short *refcount) {
 #endif
 }
 
+/* item_lock() must be held for an item before any modifications to either its
+ * associated hash bucket, or the structure itself.
+ * LRU modifications must hold the item lock, and the LRU lock.
+ * LRU's accessing items must item_trylock() before modifying an item.
+ * Items accessable from an LRU must not be freed or modified
+ * without first locking and removing from the LRU.
+ */
+
 void item_lock(uint32_t hv) {
     mutex_lock(&item_locks[hv & hashmask(item_lock_hashpower)]);
 }
 
-/* Special case. When ITEM_LOCK_GLOBAL mode is enabled, this should become a
- * no-op, as it's only called from within the item lock if necessary.
- * However, we can't mix a no-op and threads which are still synchronizing to
- * GLOBAL. So instead we just always try to lock. When in GLOBAL mode this
- * turns into an effective no-op. Threads re-synchronize after the power level
- * switch so it should stay safe.
- */
 void *item_trylock(uint32_t hv) {
     pthread_mutex_t *lock = &item_locks[hv & hashmask(item_lock_hashpower)];
     if (pthread_mutex_trylock(lock) == 0) {
@@ -154,9 +155,7 @@ static void register_thread_initialized(void) {
     pthread_mutex_unlock(&worker_hang_lock);
 }
 
-/* Must not be called with any deeper locks held:
- * item locks, cache_lock, stats_lock, etc
- */
+/* Must not be called with any deeper locks held */
 void pause_threads(enum pause_thread_types type) {
     char buf[1];
     int i;
@@ -166,6 +165,7 @@ void pause_threads(enum pause_thread_types type) {
         case PAUSE_ALL_THREADS:
             slabs_rebalancer_pause();
             lru_crawler_pause();
+            lru_maintainer_pause();
         case PAUSE_WORKER_THREADS:
             buf[0] = 'p';
             pthread_mutex_lock(&worker_hang_lock);
@@ -173,6 +173,7 @@ void pause_threads(enum pause_thread_types type) {
         case RESUME_ALL_THREADS:
             slabs_rebalancer_resume();
             lru_crawler_resume();
+            lru_maintainer_resume();
         case RESUME_WORKER_THREADS:
             pthread_mutex_unlock(&worker_hang_lock);
             break;
@@ -597,51 +598,6 @@ enum store_item_type store_item(item *item, int comm, conn* c) {
     return ret;
 }
 
-/*
- * Flushes expired items after a flush_all call
- */
-void item_flush_expired() {
-    mutex_lock(&cache_lock);
-    do_item_flush_expired();
-    mutex_unlock(&cache_lock);
-}
-
-/*
- * Dumps part of the cache
- */
-char *item_cachedump(unsigned int slabs_clsid, unsigned int limit, unsigned int *bytes) {
-    char *ret;
-
-    mutex_lock(&cache_lock);
-    ret = do_item_cachedump(slabs_clsid, limit, bytes);
-    mutex_unlock(&cache_lock);
-    return ret;
-}
-
-/*
- * Dumps statistics about slab classes
- */
-void  item_stats(ADD_STAT add_stats, void *c) {
-    mutex_lock(&cache_lock);
-    do_item_stats(add_stats, c);
-    mutex_unlock(&cache_lock);
-}
-
-void  item_stats_totals(ADD_STAT add_stats, void *c) {
-    mutex_lock(&cache_lock);
-    do_item_stats_totals(add_stats, c);
-    mutex_unlock(&cache_lock);
-}
-
-/*
- * Dumps a list of objects of each size in 32-byte increments
- */
-void  item_stats_sizes(ADD_STAT add_stats, void *c) {
-    mutex_lock(&cache_lock);
-    do_item_stats_sizes(add_stats, c);
-    mutex_unlock(&cache_lock);
-}
-
 /******************************* GLOBAL STATS ******************************/
 
 void STATS_LOCK() {
@@ -769,7 +725,9 @@ void memcached_thread_init(int nthreads, struct event_base *main_base) {
     int         i;
     int         power;
 
-    pthread_mutex_init(&cache_lock, NULL);
+    for (i = 0; i < POWER_LARGEST; i++) {
+        pthread_mutex_init(&lru_locks[i], NULL);
+    }
     pthread_mutex_init(&worker_hang_lock, NULL);
 
     pthread_mutex_init(&init_lock, NULL);

@@ -63,13 +63,14 @@ my $sock = $server->sock;
 ## STAT reclaimed 0
 ## STAT crawler_reclaimed 0
 ## STAT lrutail_reflocked 0
+## see doc/protocol.txt for others
 # note that auth stats are tested in auth specfic tests
 
 
 my $stats = mem_stats($sock);
 
 # Test number of keys
-is(scalar(keys(%$stats)), 51, "51 stats values");
+is(scalar(keys(%$stats)), 52, "52 stats values");
 
 # Test initial state
 foreach my $key (qw(curr_items total_items bytes cmd_get cmd_set get_hits evictions get_misses

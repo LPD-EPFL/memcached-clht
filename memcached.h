@@ -77,9 +77,10 @@
 
 /* Slab sizing definitions. */
 #define POWER_SMALLEST 1
-#define POWER_LARGEST  200
+#define POWER_LARGEST  256 /* actual cap is 255 */
 #define CHUNK_ALIGN_BYTES 8
-#define MAX_NUMBER_OF_SLAB_CLASSES (POWER_LARGEST + 1)
+/* slab class max is a 6-bit number, -1. */
+#define MAX_NUMBER_OF_SLAB_CLASSES (63 + 1)
 
 /** How long an object can reasonably be assumed to be locked before
     harvesting it on a low memory condition. Default: disabled. */
@@ -108,6 +109,8 @@
 #define ITEM_ntotal(item) (sizeof(struct _stritem) + (item)->nkey + 1 \
          + (item)->nsuffix + (item)->nbytes \
          + (((item)->it_flags & ITEM_CAS) ? sizeof(uint64_t) : 0))
+
+#define ITEM_clsid(item) ((item)->slabs_clsid & ~(3<<6))
 
 #define STAT_KEY_LEN 128
 #define STAT_VAL_LEN 128
@@ -282,7 +285,9 @@ struct stats {
     uint64_t      evicted_unfetched; /* items evicted but never touched */
     bool          slab_reassign_running; /* slab reassign in progress */
     uint64_t      slabs_moved;       /* times slabs were moved around */
+    uint64_t      lru_crawler_starts; /* Number of item crawlers kicked off */
     bool          lru_crawler_running; /* crawl in progress */
+    uint64_t      lru_maintainer_juggles; /* number of LRU bg pokes */
 };
 
 #define MAX_VERBOSITY_LEVEL 2
@@ -299,6 +304,7 @@ struct settings {
     char *inter;
     int verbose;
     rel_time_t oldest_live; /* ignore existing items older than this */
+    uint64_t oldest_cas; /* ignore existing items with CAS values lower than this */
     int evict_to_free;
     char *socketpath;   /* path to unix socket if using local socket */
     int access;  /* access mask (a la chmod) for unix domain socket */
@@ -317,6 +323,7 @@ struct settings {
     bool sasl;              /* SASL on/off */
     bool maxconns_fast;     /* Whether or not to early close connections */
     bool lru_crawler;        /* Whether or not to enable the autocrawler thread */
+    bool lru_maintainer_thread; /* LRU maintainer background thread */
     bool slab_reassign;     /* Whether or not slab reassignment is allowed */
     int slab_automove;     /* Whether or not to automatically move slabs */
     int hashpower_init;     /* Starting hash power level */
@@ -326,6 +333,10 @@ struct settings {
     char *hash_algorithm;     /* Hash algorithm in use */
     int lru_crawler_sleep;  /* Microsecond sleep between items */
     uint32_t lru_crawler_tocrawl; /* Number of items to crawl per run */
+    int hot_lru_pct; /* percentage of slab space for HOT_LRU */
+    int warm_lru_pct; /* percentage of slab space for WARM_LRU */
+    int crawls_persleep; /* Number of LRU crawls to run before sleeping */
+    bool expirezero_does_not_evict; /* exptime == 0 goes into NOEXP_LRU */
 };
 
 extern struct stats stats;
@@ -338,14 +349,19 @@ extern struct settings settings;
 /* temp */
 #define ITEM_SLABBED 4
 
+/* Item was fetched at least once in its lifetime */
 #define ITEM_FETCHED 8
+/* Appended on fetch, removed on LRU shuffling */
+#define ITEM_ACTIVE 16
 
 /**
  * Structure for storing items within memcached.
  */
 typedef struct _stritem {
+    /* Protected by LRU locks */
     struct _stritem *next;
     struct _stritem *prev;
+    /* Rest are protected by an item lock */
     struct _stritem *h_next;    /* hash chain next */
     rel_time_t      time;       /* least recent access */
     rel_time_t      exptime;    /* expire time */
@@ -525,12 +541,7 @@ enum store_item_type do_store_item(item *item, int comm, conn* c, const uint32_t
 conn *conn_new(const int sfd, const enum conn_states init_state, const int event_flags, const int read_buffer_size, enum network_transport transport, struct event_base *base);
 extern int daemonize(int nochdir, int noclose);
 
-static inline int mutex_lock(pthread_mutex_t *mutex)
-{
-    while (pthread_mutex_trylock(mutex));
-    return 0;
-}
-
+#define mutex_lock(x) pthread_mutex_lock(x)
 #define mutex_unlock(x) pthread_mutex_unlock(x)
 
 #include "stats.h"
@@ -562,16 +573,11 @@ conn *conn_from_freelist(void);
 bool  conn_add_to_freelist(conn *c);
 int   is_listen_thread(void);
 item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbytes);
-char *item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, unsigned int *bytes);
-void  item_flush_expired(void);
 item *item_get(const char *key, const size_t nkey);
 item *item_touch(const char *key, const size_t nkey, uint32_t exptime);
 int   item_link(item *it);
 void  item_remove(item *it);
 int   item_replace(item *it, item *new_it, const uint32_t hv);
-void  item_stats(ADD_STAT add_stats, void *c);
-void  item_stats_totals(ADD_STAT add_stats, void *c);
-void  item_stats_sizes(ADD_STAT add_stats, void *c);
 void  item_unlink(item *it);
 void  item_update(item *it);
 

@@ -180,9 +180,11 @@ static void stats_init(void) {
     stats.hash_power_level = stats.hash_bytes = stats.hash_is_expanding = 0;
     stats.expired_unfetched = stats.evicted_unfetched = 0;
     stats.slabs_moved = 0;
+    stats.lru_maintainer_juggles = 0;
     stats.accepting_conns = true; /* assuming we start in this state. */
     stats.slab_reassign_running = false;
     stats.lru_crawler_running = false;
+    stats.lru_crawler_starts = 0;
 
     /* make the time we started always be 2 seconds before we really
        did, so time(0) - time.started is never zero.  if so, things
@@ -217,6 +219,7 @@ static void settings_init(void) {
     settings.maxconns = 1024;         /* to limit connections-related memory to about 5MB */
     settings.verbose = 0;
     settings.oldest_live = 0;
+    settings.oldest_cas = 0;          /* supplements accuracy of oldest_live */
     settings.evict_to_free = 1;       /* push old items out of cache when memory runs out */
     settings.socketpath = NULL;       /* by default, not using a unix socket */
     settings.factor = 1.25;
@@ -233,12 +236,17 @@ static void settings_init(void) {
     settings.lru_crawler = false;
     settings.lru_crawler_sleep = 100;
     settings.lru_crawler_tocrawl = 0;
+    settings.lru_maintainer_thread = false;
+    settings.hot_lru_pct = 32;
+    settings.warm_lru_pct = 32;
+    settings.expirezero_does_not_evict = false;
     settings.hashpower_init = 0;
     settings.slab_reassign = false;
     settings.slab_automove = 0;
     settings.shutdown_command = false;
     settings.tail_repair_time = TAIL_REPAIR_TIME_DEFAULT;
     settings.flush_enabled = true;
+    settings.crawls_persleep = 1000;
 }
 
 /*
@@ -887,7 +895,7 @@ static void complete_nread_ascii(conn *c) {
     enum store_item_type ret;
 
     pthread_mutex_lock(&c->thread->stats.mutex);
-    c->thread->stats.slab_stats[it->slabs_clsid].set_cmds++;
+    c->thread->stats.slab_stats[ITEM_clsid(it)].set_cmds++;
     pthread_mutex_unlock(&c->thread->stats.mutex);
 
     if (strncmp(ITEM_data(it) + it->nbytes - 2, "\r\n", 2) != 0) {
@@ -1197,7 +1205,7 @@ static void complete_update_bin(conn *c) {
     item *it = c->item;
 
     pthread_mutex_lock(&c->thread->stats.mutex);
-    c->thread->stats.slab_stats[it->slabs_clsid].set_cmds++;
+    c->thread->stats.slab_stats[ITEM_clsid(it)].set_cmds++;
     pthread_mutex_unlock(&c->thread->stats.mutex);
 
     /* We don't actually receive the trailing two characters in the bin
@@ -1296,10 +1304,10 @@ static void process_bin_get_or_touch(conn *c) {
         pthread_mutex_lock(&c->thread->stats.mutex);
         if (should_touch) {
             c->thread->stats.touch_cmds++;
-            c->thread->stats.slab_stats[it->slabs_clsid].touch_hits++;
+            c->thread->stats.slab_stats[ITEM_clsid(it)].touch_hits++;
         } else {
             c->thread->stats.get_cmds++;
-            c->thread->stats.slab_stats[it->slabs_clsid].get_hits++;
+            c->thread->stats.slab_stats[ITEM_clsid(it)].get_hits++;
         }
         pthread_mutex_unlock(&c->thread->stats.mutex);
 
@@ -2138,6 +2146,7 @@ static void process_bin_append_prepend(conn *c) {
 static void process_bin_flush(conn *c) {
     time_t exptime = 0;
     protocol_binary_request_flush* req = binary_get_request(c);
+    rel_time_t new_oldest = 0;
 
     if (!settings.flush_enabled) {
       // flush_all is not allowed but we log it on stats
@@ -2150,11 +2159,17 @@ static void process_bin_flush(conn *c) {
     }
 
     if (exptime > 0) {
-        settings.oldest_live = realtime(exptime) - 1;
+        new_oldest = realtime(exptime);
     } else {
-        settings.oldest_live = current_time - 1;
+        new_oldest = current_time;
     }
-    item_flush_expired();
+    if (settings.use_cas) {
+        settings.oldest_live = new_oldest - 1;
+        if (settings.oldest_live <= current_time)
+            settings.oldest_cas = get_cas_id();
+    } else {
+        settings.oldest_live = new_oldest;
+    }
 
     pthread_mutex_lock(&c->thread->stats.mutex);
     c->thread->stats.flush_cmds++;
@@ -2192,7 +2207,7 @@ static void process_bin_delete(conn *c) {
         if (cas == 0 || cas == ITEM_get_cas(it)) {
             MEMCACHED_COMMAND_DELETE(c->sfd, ITEM_key(it), it->nkey);
             pthread_mutex_lock(&c->thread->stats.mutex);
-            c->thread->stats.slab_stats[it->slabs_clsid].delete_hits++;
+            c->thread->stats.slab_stats[ITEM_clsid(it)].delete_hits++;
             pthread_mutex_unlock(&c->thread->stats.mutex);
             item_unlink(it);
             write_bin_response(c, NULL, 0, 0, 0);
@@ -2314,14 +2329,14 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
             // it and old_it may belong to different classes.
             // I'm updating the stats for the one that's getting pushed out
             pthread_mutex_lock(&c->thread->stats.mutex);
-            c->thread->stats.slab_stats[old_it->slabs_clsid].cas_hits++;
+            c->thread->stats.slab_stats[ITEM_clsid(old_it)].cas_hits++;
             pthread_mutex_unlock(&c->thread->stats.mutex);
 
             item_replace(old_it, it, hv);
             stored = STORED;
         } else {
             pthread_mutex_lock(&c->thread->stats.mutex);
-            c->thread->stats.slab_stats[old_it->slabs_clsid].cas_badval++;
+            c->thread->stats.slab_stats[ITEM_clsid(old_it)].cas_badval++;
             pthread_mutex_unlock(&c->thread->stats.mutex);
 
             if(settings.verbose > 1) {
@@ -2619,6 +2634,10 @@ static void server_stats(ADD_STAT add_stats, conn *c) {
     }
     if (settings.lru_crawler) {
         APPEND_STAT("lru_crawler_running", "%u", stats.lru_crawler_running);
+        APPEND_STAT("lru_crawler_starts", "%u", stats.lru_crawler_starts);
+    }
+    if (settings.lru_maintainer_thread) {
+        APPEND_STAT("lru_maintainer_juggles", "%llu", (unsigned long long)stats.lru_maintainer_juggles);
     }
     APPEND_STAT("malloc_fails", "%llu",
                 (unsigned long long)stats.malloc_fails);
@@ -2662,6 +2681,10 @@ static void process_stat_settings(ADD_STAT add_stats, void *c) {
     APPEND_STAT("tail_repair_time", "%d", settings.tail_repair_time);
     APPEND_STAT("flush_enabled", "%s", settings.flush_enabled ? "yes" : "no");
     APPEND_STAT("hash_algorithm", "%s", settings.hash_algorithm);
+    APPEND_STAT("lru_maintainer_thread", "%s", settings.lru_maintainer_thread ? "yes" : "no");
+    APPEND_STAT("hot_lru_pct", "%d", settings.hot_lru_pct);
+    APPEND_STAT("warm_lru_pct", "%d", settings.hot_lru_pct);
+    APPEND_STAT("expirezero_does_not_evict", "%s", settings.expirezero_does_not_evict ? "yes" : "no");
 }
 
 static void conn_to_str(const conn *c, char *buf) {
@@ -2812,7 +2835,7 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
             return;
         }
 
-        if (id >= POWER_LARGEST) {
+        if (id >= MAX_NUMBER_OF_SLAB_CLASSES-1) {
             out_string(c, "CLIENT_ERROR Illegal slab id");
             return;
         }
@@ -2971,7 +2994,7 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
 
                 /* item_get() has incremented it->refcount for us */
                 pthread_mutex_lock(&c->thread->stats.mutex);
-                c->thread->stats.slab_stats[it->slabs_clsid].get_hits++;
+                c->thread->stats.slab_stats[ITEM_clsid(it)].get_hits++;
                 c->thread->stats.get_cmds++;
                 pthread_mutex_unlock(&c->thread->stats.mutex);
                 item_update(it);
@@ -3141,7 +3164,7 @@ static void process_touch_command(conn *c, token_t *tokens, const size_t ntokens
         item_update(it);
         pthread_mutex_lock(&c->thread->stats.mutex);
         c->thread->stats.touch_cmds++;
-        c->thread->stats.slab_stats[it->slabs_clsid].touch_hits++;
+        c->thread->stats.slab_stats[ITEM_clsid(it)].touch_hits++;
         pthread_mutex_unlock(&c->thread->stats.mutex);
 
         out_string(c, "TOUCHED");
@@ -3261,9 +3284,9 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
 
     pthread_mutex_lock(&c->thread->stats.mutex);
     if (incr) {
-        c->thread->stats.slab_stats[it->slabs_clsid].incr_hits++;
+        c->thread->stats.slab_stats[ITEM_clsid(it)].incr_hits++;
     } else {
-        c->thread->stats.slab_stats[it->slabs_clsid].decr_hits++;
+        c->thread->stats.slab_stats[ITEM_clsid(it)].decr_hits++;
     }
     pthread_mutex_unlock(&c->thread->stats.mutex);
 
@@ -3275,9 +3298,7 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
     if (res + 2 <= it->nbytes && it->refcount == 2) { /* replace in-place */
         /* When changing the value without replacing the item, we
            need to update the CAS on the existing item. */
-        mutex_lock(&cache_lock); /* FIXME */
         ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
-        mutex_unlock(&cache_lock);
 
         memcpy(ITEM_data(it), buf, res);
         memset(ITEM_data(it) + res, ' ', it->nbytes - res - 2);
@@ -3351,7 +3372,7 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
         MEMCACHED_COMMAND_DELETE(c->sfd, ITEM_key(it), it->nkey);
 
         pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.slab_stats[it->slabs_clsid].delete_hits++;
+        c->thread->stats.slab_stats[ITEM_clsid(it)].delete_hits++;
         pthread_mutex_unlock(&c->thread->stats.mutex);
 
         item_unlink(it);
@@ -3471,6 +3492,7 @@ static void process_command(conn *c, char *command) {
 
     } else if (ntokens >= 2 && ntokens <= 4 && (strcmp(tokens[COMMAND_TOKEN].value, "flush_all") == 0)) {
         time_t exptime = 0;
+        rel_time_t new_oldest = 0;
 
         set_noreply_maybe(c, tokens, ntokens);
 
@@ -3484,17 +3506,12 @@ static void process_command(conn *c, char *command) {
             return;
         }
 
-        if(ntokens == (c->noreply ? 3 : 2)) {
-            settings.oldest_live = current_time - 1;
-            item_flush_expired();
-            out_string(c, "OK");
-            return;
-        }
-
-        exptime = strtol(tokens[1].value, NULL, 10);
-        if(errno == ERANGE) {
-            out_string(c, "CLIENT_ERROR bad command line format");
-            return;
+        if (ntokens != (c->noreply ? 3 : 2)) {
+            exptime = strtol(tokens[1].value, NULL, 10);
+            if(errno == ERANGE) {
+                out_string(c, "CLIENT_ERROR bad command line format");
+                return;
+            }
         }
 
         /*
@@ -3503,11 +3520,19 @@ static void process_command(conn *c, char *command) {
           value.  So we process exptime == 0 the same way we do when
           no delay is given at all.
         */
-        if (exptime > 0)
-            settings.oldest_live = realtime(exptime) - 1;
-        else /* exptime == 0 */
-            settings.oldest_live = current_time - 1;
-        item_flush_expired();
+        if (exptime > 0) {
+            new_oldest = realtime(exptime);
+        } else { /* exptime == 0 */
+            new_oldest = current_time;
+        }
+
+        if (settings.use_cas) {
+            settings.oldest_live = new_oldest - 1;
+            if (settings.oldest_live <= current_time)
+                settings.oldest_cas = get_cas_id();
+        } else {
+            settings.oldest_live = new_oldest;
+        }
         out_string(c, "OK");
         return;
 
@@ -3588,6 +3613,9 @@ static void process_command(conn *c, char *command) {
                 break;
             case CRAWLER_BADCLASS:
                 out_string(c, "BADCLASS invalid class id");
+                break;
+            case CRAWLER_NOTSTARTED:
+                out_string(c, "NOTSTARTED no items to crawl");
                 break;
             }
             return;
@@ -4808,7 +4836,7 @@ static void usage(void) {
            "                restart.\n"
            "              - tail_repair_time: Time in seconds that indicates how long to wait before\n"
            "                forcefully taking over the LRU tail item whose refcount has leaked.\n"
-           "                The default is 3 hours.\n"
+           "                Disabled by default; dangerous option.\n"
            "              - hash_algorithm: The hash table algorithm\n"
            "                default is jenkins hash. options: jenkins, murmur3\n"
            "              - lru_crawler: Enable LRU Crawler background thread\n"
@@ -4816,6 +4844,13 @@ static void usage(void) {
            "                default is 100.\n"
            "              - lru_crawler_tocrawl: Max items to crawl per slab per run\n"
            "                default is 0 (unlimited)\n"
+           "              - lru_maintainer: Enable new LRU system + background thread\n"
+           "              - hot_lru_pct: Pct of slab memory to reserve for hot lru.\n"
+           "                (requires lru_maintainer)\n"
+           "              - warm_lru_pct: Pct of slab memory to reserve for warm lru.\n"
+           "                (requires lru_maintainer)\n"
+           "              - expirezero_does_not_evict: Items set to not expire, will not evict.\n"
+           "                (requires lru_maintainer)\n"
            );
     return;
 }
@@ -5044,6 +5079,8 @@ int main (int argc, char **argv) {
     bool protocol_specified = false;
     bool tcp_specified = false;
     bool udp_specified = false;
+    bool start_lru_maintainer = false;
+    bool start_lru_crawler = false;
     enum hashfunc_type hash_type = JENKINS_HASH;
     uint32_t tocrawl;
 
@@ -5058,7 +5095,11 @@ int main (int argc, char **argv) {
         HASH_ALGORITHM,
         LRU_CRAWLER,
         LRU_CRAWLER_SLEEP,
-        LRU_CRAWLER_TOCRAWL
+        LRU_CRAWLER_TOCRAWL,
+        LRU_MAINTAINER,
+        HOT_LRU_PCT,
+        WARM_LRU_PCT,
+        NOEXP_NOEVICT
     };
     char *const subopts_tokens[] = {
         [MAXCONNS_FAST] = "maxconns_fast",
@@ -5070,6 +5111,10 @@ int main (int argc, char **argv) {
         [LRU_CRAWLER] = "lru_crawler",
         [LRU_CRAWLER_SLEEP] = "lru_crawler_sleep",
         [LRU_CRAWLER_TOCRAWL] = "lru_crawler_tocrawl",
+        [LRU_MAINTAINER] = "lru_maintainer",
+        [HOT_LRU_PCT] = "hot_lru_pct",
+        [WARM_LRU_PCT] = "warm_lru_pct",
+        [NOEXP_NOEVICT] = "expirezero_does_not_evict",
         NULL
     };
 
@@ -5086,6 +5131,7 @@ int main (int argc, char **argv) {
 
     /* Run regardless of initializing it later */
     init_lru_crawler();
+    init_lru_maintainer();
 
     /* set stderr non-buffering (for running under, say, daemontools) */
     setbuf(stderr, NULL);
@@ -5378,10 +5424,7 @@ int main (int argc, char **argv) {
                 }
                 break;
             case LRU_CRAWLER:
-                if (start_item_crawler_thread() != 0) {
-                    fprintf(stderr, "Failed to enable LRU crawler thread\n");
-                    return 1;
-                }
+                start_lru_crawler = true;
                 break;
             case LRU_CRAWLER_SLEEP:
                 settings.lru_crawler_sleep = atoi(subopts_value);
@@ -5397,6 +5440,34 @@ int main (int argc, char **argv) {
                 }
                 settings.lru_crawler_tocrawl = tocrawl;
                 break;
+            case LRU_MAINTAINER:
+                start_lru_maintainer = true;
+                break;
+            case HOT_LRU_PCT:
+                if (subopts_value == NULL) {
+                    fprintf(stderr, "Missing hot_lru_pct argument\n");
+                    return 1;
+                };
+                settings.hot_lru_pct = atoi(subopts_value);
+                if (settings.hot_lru_pct < 1 || settings.hot_lru_pct >= 80) {
+                    fprintf(stderr, "hot_lru_pct must be > 1 and < 80\n");
+                    return 1;
+                }
+                break;
+            case WARM_LRU_PCT:
+                if (subopts_value == NULL) {
+                    fprintf(stderr, "Missing warm_lru_pct argument\n");
+                    return 1;
+                };
+                settings.warm_lru_pct = atoi(subopts_value);
+                if (settings.warm_lru_pct < 1 || settings.warm_lru_pct >= 80) {
+                    fprintf(stderr, "warm_lru_pct must be > 1 and < 80\n");
+                    return 1;
+                }
+                break;
+            case NOEXP_NOEVICT:
+                settings.expirezero_does_not_evict = true;
+                break;
             default:
                 printf("Illegal suboption \"%s\"\n", subopts_value);
                 return 1;
@@ -5408,6 +5479,11 @@ int main (int argc, char **argv) {
             fprintf(stderr, "Illegal argument \"%c\"\n", c);
             return 1;
         }
+    }
+
+    if (settings.lru_maintainer_thread && settings.hot_lru_pct + settings.warm_lru_pct > 80) {
+        fprintf(stderr, "hot_lru_pct + warm_lru_pct cannot be more than 80%% combined\n");
+        exit(EX_USAGE);
     }
 
     if (hash_init(hash_type) != 0) {
@@ -5553,6 +5629,16 @@ int main (int argc, char **argv) {
 
     if (start_assoc_maintenance_thread() == -1) {
         exit(EXIT_FAILURE);
+    }
+
+    if (start_lru_crawler && start_item_crawler_thread() != 0) {
+        fprintf(stderr, "Failed to enable LRU crawler thread\n");
+        exit(EXIT_FAILURE);
+    }
+
+    if (start_lru_maintainer && start_lru_maintainer_thread() != 0) {
+        fprintf(stderr, "Failed to enable LRU maintainer thread\n");
+        return 1;
     }
 
     if (settings.slab_reassign &&

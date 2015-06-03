@@ -2,7 +2,7 @@
 
 use strict;
 use warnings;
-use Test::More tests => 3615;
+use Test::More tests => 3639;
 use FindBin qw($Bin);
 use lib "$Bin/lib";
 use MemcachedTest;
@@ -612,7 +612,6 @@ sub _handle_single_response {
         my $found = length($rv);
         die("Expected $remaining bytes, got $found");
     }
-
     if (defined $myopaque) {
         Test::More::is($opaque, $myopaque, "Expected opaque");
     } else {

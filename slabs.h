@@ -19,7 +19,7 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc);
 unsigned int slabs_clsid(const size_t size);
 
 /** Allocate object of given length. 0 on error */ /*@null@*/
-void *slabs_alloc(const size_t size, unsigned int id);
+void *slabs_alloc(const size_t size, unsigned int id, unsigned int *total_chunks);
 
 /** Free previously allocated object */
 void slabs_free(void *ptr, size_t size, unsigned int id);
@@ -32,6 +32,9 @@ bool get_stats(const char *stat_type, int nkey, ADD_STAT add_stats, void *c);
 
 /** Fill buffer with stats */ /*@null@*/
 void slabs_stats(ADD_STAT add_stats, void *c);
+
+/* Hints as to freespace in slab class */
+unsigned int slabs_available_chunks(unsigned int id, bool *mem_flag, unsigned int *total_chunks);
 
 int start_slab_maintenance_thread(void);
 void stop_slab_maintenance_thread(void);
