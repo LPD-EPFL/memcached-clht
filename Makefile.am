@@ -33,6 +33,21 @@ if ENABLE_SASL
 memcached_SOURCES += sasl_defs.c
 endif
 
+if USE_CLHT_LB
+memcached_SOURCES += atomic_ops.h clht.h \
+		     ssmem.h ssmem.c \
+                     clht_lb_res.h clht_lb_res.c clht_gc.c
+CFLAGS += -DCLHT
+else
+if USE_CLHT_LF
+memcached_SOURCES += atomic_ops.h clht.h \
+		     ssmem.h ssmem.c \
+		     clht_lf_res.h clht_lf_res.c \
+		     clht_lb_res.h clht_gc.c
+CFLAGS += -DCLHT
+endif
+endif
+
 memcached_debug_SOURCES = $(memcached_SOURCES)
 memcached_CPPFLAGS = -DNDEBUG
 memcached_debug_LDADD = @PROFILER_LDFLAGS@

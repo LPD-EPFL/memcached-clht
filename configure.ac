@@ -569,6 +569,33 @@ AM_CONDITIONAL([BUILD_SPECIFICATIONS],
                [test "x$enable_docs" != "xno" -a "x$XML2RFC" != "xno" -a "x$XSLTPROC" != "xno"])
 
 
+dnl **********************************************************************
+dnl Add support for CLHT as the underlying hashtable
+dnl **********************************************************************
+AC_ARG_ENABLE(
+    [clht_lb],
+    [  --enable-clht-lb    Use lock-based clht as the hashtable],
+    [case "${enableval}" in
+        yes) clht_lb=true ;;
+        no)  clht_lb=false ;;
+        *) AC_MSG_ERROR([bad value ${enableval} for --enable-clht-lb]) ;;
+     esac],
+    [clht_lb=false]
+)
+AC_ARG_ENABLE(
+    [clht_lf],
+    [  --enable-clht-lf    Use lock-free clht as the hashtable],
+    [case "${enableval}" in
+        yes) clht_lf=true ;;
+        no)  clht_lf=false ;;
+        *) AC_MSG_ERROR([bad value ${enableval} for --enable-clht-lf]) ;;
+     esac],
+    [clht_lf=false]
+)
+AM_CONDITIONAL([USE_CLHT_LB], [test x$clht_lb = xtrue])
+AM_CONDITIONAL([USE_CLHT_LF], [test x$clht_lf = xtrue])
+
+
 dnl Let the compiler be a bit more picky. Please note that you cannot
 dnl specify these flags to the compiler before AC_CHECK_FUNCS, because
 dnl the test program will generate a compilation warning and hence fail
