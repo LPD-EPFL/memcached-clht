@@ -366,8 +366,10 @@ clht_t* clht_create(uint32_t num_buckets);
 void clht_gc_thread_init(clht_t* hashtable, int id);
 
 
-/* Insert a key-value pair into a hashtable. */
+/* Insert a key-value pair into a hashtable if the key doesn't exist. */
 int clht_put(clht_t* hashtable, clht_addr_t key, clht_val_t val);
+/* Insert a key-value pair into a hashtable. Return old value if it existed */
+clht_val_t clht_set(clht_t* hashtable, clht_addr_t key, clht_val_t val);
 /* Retrieve a key-value pair from a hashtable. */
 clht_val_t clht_get(clht_hashtable_t* hashtable, clht_addr_t key);
 /* Remove a key-value pair from a hashtable. */

@@ -248,16 +248,17 @@ bucket_exists(volatile bucket_t* bucket, clht_addr_t key)
   return false;
 }
 
+
 /* Insert a key-value entry into a hash table. */
-int
-clht_put(clht_t* h, clht_addr_t key, clht_val_t val) 
+static clht_val_t
+_clht_put(clht_t* h, clht_addr_t key, clht_val_t val, int replace)
 {
   clht_hashtable_t* hashtable = h->ht;
   size_t bin = clht_hash(hashtable, key);
   volatile bucket_t* bucket = hashtable->table + bin;
 
 #if CLHT_READ_ONLY_FAIL == 1
-  if (bucket_exists(bucket, key))
+  if (!replace && bucket_exists(bucket, key))
     {
       return false;
     }
@@ -285,8 +286,15 @@ clht_put(clht_t* h, clht_addr_t key, clht_val_t val)
 	{
 	  if (bucket->key[j] == key) 
 	    {
-	      LOCK_RLS(lock);
-	      return false;
+              if (replace) {
+                clht_val_t oldval = bucket->val[j];
+                bucket->val[j] = val;
+                LOCK_RLS(lock);
+                return oldval;
+              } else {
+                LOCK_RLS(lock);
+                return false;
+              }
 	    }
 	  else if (empty == NULL && bucket->key[j] == 0)
 	    {
@@ -331,11 +339,31 @@ clht_put(clht_t* h, clht_addr_t key, clht_val_t val)
 	      /* ht_resize_pes(h, 1); */
 	      ht_status(h, 1, 0);
 	    }
-	  return true;
+          if (replace) {
+            return 0;
+          } else {
+	    return true;
+          }
 	}
       bucket = bucket->next;
     }
   while (true);
+}
+
+/* put semantics: store if key doesn't exist
+                  return nonzero on success, 0 on failure */
+int
+clht_put(clht_t* h, clht_addr_t key, clht_val_t val)
+{
+  return (int)_clht_put(h, key, val, false);
+}
+
+/* set semantics: always store
+                  return old value if it existed, otherwise 0 */
+clht_val_t
+clht_set(clht_t* h, clht_addr_t key, clht_val_t val)
+{
+  return _clht_put(h, key, val, true);
 }
 
 
