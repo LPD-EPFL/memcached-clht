@@ -34,10 +34,11 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <inttypes.h>
-#include "atomic_ops.h"
-#include "utils.h"
+#include <xmmintrin.h>
 
+#include "atomic_ops.h"
 #include "ssmem.h"
+
 extern __thread ssmem_allocator_t* clht_alloc;
 
 #define true 1
@@ -78,8 +79,12 @@ extern __thread ssmem_allocator_t* clht_alloc;
 #  endif
 #endif
 
-#define likely(x)       __builtin_expect((x), 1)
-#define unlikely(x)     __builtin_expect((x), 0)
+#ifndef likely
+#  define likely(x)       __builtin_expect((x), 1)
+#endif
+#ifndef unlikely
+#  define unlikely(x)     __builtin_expect((x), 0)
+#endif
 
 #if defined(__sparc__)
 #  define PREFETCHW(x) 
@@ -105,12 +110,13 @@ extern __thread ssmem_allocator_t* clht_alloc;
 #endif
 
 #define CAS_U64_BOOL(a, b, c) (CAS_U64(a, b, c) == b)
-inline int is_power_of_two(unsigned int x);
 
 typedef uintptr_t clht_addr_t;
 typedef volatile uintptr_t clht_val_t;
 typedef uint64_t clht_snapshot_all_t;
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
 typedef union
 {
   volatile uint64_t snapshot;
@@ -126,11 +132,14 @@ typedef union
     uint8_t map[KEY_BUCKT];
   };
 } clht_snapshot_t;
+#pragma GCC diagnostic pop
 
 #if __GNUC__ > 4 && __GNUC_MINOR__ > 4
 _Static_assert (sizeof(clht_snapshot_t) == 8, "sizeof(clht_snapshot_t) == 8");
 #endif
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
 typedef volatile struct ALIGNED(CACHE_LINE_SIZE) bucket_s
 {
   union
@@ -153,6 +162,7 @@ typedef volatile struct ALIGNED(CACHE_LINE_SIZE) bucket_s
   clht_val_t  val[KEY_BUCKT];
   volatile struct bucket_s* padding;
 } bucket_t;
+#pragma GCC diagnostic pop
 
 #if __GNUC__ > 4 && __GNUC_MINOR__ > 4
 _Static_assert (sizeof(bucket_t) % 64 == 0, "sizeof(bucket_t) == 64");
@@ -186,7 +196,8 @@ typedef volatile uint8_t clht_lock_t;
 #define TRYLOCK_RLS(lock)			\
   lock = CLHT_LOCK_FREE
 
-
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
 typedef struct ALIGNED(CACHE_LINE_SIZE) clht
 {
   union
@@ -205,7 +216,10 @@ typedef struct ALIGNED(CACHE_LINE_SIZE) clht
     uint8_t padding[2 * CACHE_LINE_SIZE];
   };
 } clht_t;
+#pragma GCC diagnostic pop
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
 typedef struct ALIGNED(CACHE_LINE_SIZE) clht_hashtable_s
 {
   union
@@ -233,8 +247,28 @@ typedef struct ALIGNED(CACHE_LINE_SIZE) clht_hashtable_s
     uint8_t padding[2*CACHE_LINE_SIZE];
   };
 } clht_hashtable_t;
+#pragma GCC diagnostic pop
 
-inline uint64_t __ac_Jenkins_hash_64(uint64_t key);
+static inline int
+is_power_of_two (unsigned int x) 
+{
+  return ((x != 0) && !(x & (x - 1)));
+}
+
+/** Jenkins' hash function for 64-bit integers. */
+static inline uint64_t
+__ac_Jenkins_hash_64(uint64_t key)
+{
+  key += ~(key << 32);
+  key ^= (key >> 22);
+  key += ~(key << 13);
+  key ^= (key >> 8);
+  key += (key << 3);
+  key ^= (key >> 15);
+  key += ~(key << 27);
+  key ^= (key >> 31);
+  return key;
+}
 
 /* Hash a key for a particular hashtable. */
 uint32_t clht_hash(clht_hashtable_t* hashtable, clht_addr_t key );
@@ -329,6 +363,41 @@ _mm_pause_rep(uint64_t w)
     }
 }
 
+/// Round up to next higher power of 2 (return x if it's already a power
+/// of 2) for 32-bit numbers
+static inline uint32_t pow2roundup (uint32_t x){
+  if (x==0) return 1;
+  --x;
+  x |= x >> 1;
+  x |= x >> 2;
+  x |= x >> 4;
+  x |= x >> 8;
+  x |= x >> 16;
+  return x+1;
+}
+
+// Ticks
+typedef uint64_t ticks;
+
+static inline ticks getticks(void) {
+#if defined(__i386__)
+    ticks ret;
+    __asm__ __volatile__("rdtsc" : "=A" (ret));
+    return ret;
+#elif defined(__x86_64__)
+    unsigned hi, lo;
+    __asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ( (unsigned long long)lo)|( ((unsigned long long)hi)<<32 );
+#elif defined(__sparc__)
+    ticks ret = 0;
+    __asm__ __volatile__ ("rd %%tick, %0" : "=r" (ret) : "0" (ret));
+    return ret;
+#elif defined(__tile__)
+    return get_cycle_count();
+#else
+    return 0;
+#endif
+}
 
 
 /* ******************************************************************************** */
@@ -353,9 +422,9 @@ size_t clht_size_mem(clht_hashtable_t* hashtable);
 size_t clht_size_mem_garbage(clht_hashtable_t* hashtable);
 
 void clht_gc_thread_init(clht_t* hashtable, int id);
-inline void clht_gc_thread_version(clht_hashtable_t* h);
-inline void clht_gc_thread_version_max();
-inline int clht_gc_get_id();
+void clht_gc_thread_version(clht_hashtable_t* h);
+void clht_gc_thread_version_max(void);
+int clht_gc_get_id(void);
 int clht_gc_collect(clht_t* h);
 int clht_gc_collect_all(clht_t* h);
 int clht_gc_free(clht_hashtable_t* hashtable);
@@ -365,11 +434,11 @@ size_t clht_gc_min_version_used(clht_t* h);
 void clht_print(clht_hashtable_t* hashtable);
 size_t ht_status(clht_t* hashtable, int resize_increase, int emergency_increase, int just_print);
 
-bucket_t* clht_bucket_create();
+bucket_t* clht_bucket_create(void);
 int ht_resize_pes(clht_t* hashtable, int is_increase, int by);
-void  clht_print_retry_stats();
+void  clht_print_retry_stats(void);
 
-const char* clht_type_desc();
+const char* clht_type_desc(void);
 
 #endif /* _CLHT_LF_RES_H_ */
 

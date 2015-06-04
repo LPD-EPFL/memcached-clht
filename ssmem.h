@@ -67,6 +67,8 @@
 /* **************************************************************************************** */
 
 /* an ssmem allocator */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
 typedef struct ALIGNED(CACHE_LINE_SIZE) ssmem_allocator
 {
   union
@@ -96,8 +98,11 @@ typedef struct ALIGNED(CACHE_LINE_SIZE) ssmem_allocator
     uint8_t padding[2 * CACHE_LINE_SIZE];
   };
 } ssmem_allocator_t;
+#pragma GCC diagnostic pop
 
 /* a timestamp used by a thread */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
 typedef struct ALIGNED(CACHE_LINE_SIZE) ssmem_ts
 {
   union
@@ -111,6 +116,7 @@ typedef struct ALIGNED(CACHE_LINE_SIZE) ssmem_ts
   };
   uint8_t padding[CACHE_LINE_SIZE];
 } ssmem_ts_t;
+#pragma GCC diagnostic pop
 
 /* 
  * a timestamped free_set. It holds:  
@@ -161,30 +167,31 @@ void ssmem_alloc_init_fs_size(ssmem_allocator_t* a, size_t size, size_t free_set
 /* explicitely subscribe to the list of threads in order to used timestamps for GC */
 void ssmem_gc_thread_init(ssmem_allocator_t* a, int id);
 /* terminate the system (all allocators) and free all memory */
-void ssmem_term();
+void ssmem_term(void);
 /* terminate the allocator a and free all its memory
  * This function should NOT be used if the memory allocated by this allocator
  * might have been freed (and is still in use) by other allocators */
 void ssmem_alloc_term(ssmem_allocator_t* a);
 
 /* allocate some memory using allocator a */
-inline void* ssmem_alloc(ssmem_allocator_t* a, size_t size);
+void* ssmem_alloc(ssmem_allocator_t* a, size_t size);
 /* free some memory using allocator a */
-inline void ssmem_free(ssmem_allocator_t* a, void* obj);
+void ssmem_free(ssmem_allocator_t* a, void* obj);
 
 /* release some memory to the OS using allocator a */
-inline void ssmem_release(ssmem_allocator_t* a, void* obj);
+void ssmem_release(ssmem_allocator_t* a, void* obj);
 
 /* increment the thread-local activity counter. Invoking this function suggests that
  no memory references to ssmem-allocated memory are held by the current thread beyond
 this point. */
-inline void ssmem_ts_next();
+void ssmem_ts_next(void);
+
 #define SSMEM_SAFE_TO_RECLAIM() ssmem_ts_next()
 
 
 /* debug/help functions */
-void ssmem_ts_list_print();
-size_t* ssmem_ts_set_collect();
+void ssmem_ts_list_print(void);
+size_t* ssmem_ts_set_collect(size_t* ts_set);
 void ssmem_ts_set_print(size_t* set);
 
 void ssmem_free_list_print(ssmem_allocator_t* a);

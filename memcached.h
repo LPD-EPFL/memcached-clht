@@ -615,5 +615,9 @@ extern void drop_privileges(void);
 #define __builtin_expect(x, expected_value) (x)
 #endif
 
-#define likely(x)       __builtin_expect((x),1)
-#define unlikely(x)     __builtin_expect((x),0)
+#ifndef likely
+#  define likely(x)       __builtin_expect((x), 1)
+#endif
+#ifndef unlikely
+#  define unlikely(x)     __builtin_expect((x), 0)
+#endif

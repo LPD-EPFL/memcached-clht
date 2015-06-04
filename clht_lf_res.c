@@ -47,15 +47,9 @@ __thread uint32_t put_num_failed_on_new = 0;
 #include "assert.h"
 
 const char*
-clht_type_desc()
+clht_type_desc(void)
 {
   return "CLHT-LF-RESIZE";
-}
-
-inline int
-is_power_of_two (unsigned int x) 
-{
-  return ((x != 0) && !(x & (x - 1)));
 }
 
 static inline
@@ -64,24 +58,9 @@ int is_odd (int x)
   return x & 1;
 }
 
-/** Jenkins' hash function for 64-bit integers. */
-inline uint64_t
-__ac_Jenkins_hash_64(uint64_t key)
-{
-  key += ~(key << 32);
-  key ^= (key >> 22);
-  key += ~(key << 13);
-  key ^= (key >> 8);
-  key += (key << 3);
-  key ^= (key >> 15);
-  key += ~(key << 27);
-  key ^= (key >> 31);
-  return key;
-}
-
 /* Create a new bucket. */
 bucket_t*
-clht_bucket_create() 
+clht_bucket_create(void) 
 {
   bucket_t* bucket = NULL;
   bucket = memalign(CACHE_LINE_SIZE, sizeof(bucket_t));
@@ -99,8 +78,6 @@ clht_bucket_create()
 
   return bucket;
 }
-
-clht_hashtable_t* clht_hashtable_create(uint32_t num_buckets);
 
 clht_t* 
 clht_create(uint32_t num_buckets)
@@ -230,7 +207,7 @@ clht_get(clht_hashtable_t* hashtable, clht_addr_t key)
 __thread size_t num_retry_cas1 = 0, num_retry_cas2 = 0, num_retry_cas3 = 0, num_retry_cas4 = 0, num_retry_cas5 = 0;
 
 void
-clht_print_retry_stats()
+clht_print_retry_stats(void)
 {
   printf("#cas1: %-8zu / #cas2: %-8zu / #cas3: %-8zu / #cas4: %-8zu\n",
 	 num_retry_cas1, num_retry_cas2, num_retry_cas3, num_retry_cas4);

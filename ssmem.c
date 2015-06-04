@@ -41,7 +41,7 @@ __thread volatile ssmem_ts_t* ssmem_ts_local = NULL;
 __thread size_t ssmem_num_allocators = 0;
 __thread ssmem_list_t* ssmem_allocator_list = NULL;
 
-inline int 
+static inline int __attribute__ ((unused))
 ssmem_get_id()
 {
   if (ssmem_ts_local != NULL)
@@ -131,7 +131,7 @@ ssmem_alloc_init_fs_size(ssmem_allocator_t* a, size_t size, size_t free_set_size
 void
 ssmem_alloc_init(ssmem_allocator_t* a, size_t size, int id)
 {
-  return ssmem_alloc_init_fs_size(a, size, SSMEM_GC_FREE_SET_SIZE, id);
+  ssmem_alloc_init_fs_size(a, size, SSMEM_GC_FREE_SET_SIZE, id);
 }
 
 
@@ -191,7 +191,7 @@ ssmem_free_set_new(size_t size, ssmem_free_set_t* next)
 /* 
  * 
  */
-ssmem_free_set_t*
+static ssmem_free_set_t*
 ssmem_free_set_get_avail(ssmem_allocator_t* a, size_t size, ssmem_free_set_t* next)
 {
   ssmem_free_set_t* fs;
@@ -265,7 +265,7 @@ ssmem_alloc_term(ssmem_allocator_t* a)
 
   if (cur == NULL)
     {
-      printf("[ALLOC] ssmem_alloc_term: could not find %p in the ssmem_allocator_list\n", a);
+      printf("[ALLOC] ssmem_alloc_term: could not find %p in the ssmem_allocator_list\n", (void*)a);
     }
   else if (cur == prv)
     {
@@ -328,7 +328,7 @@ ssmem_alloc_term(ssmem_allocator_t* a)
  * terminate all allocators
  */
 void
-ssmem_term()
+ssmem_term(void)
 {
   while (ssmem_allocator_list != NULL)
     {
@@ -340,7 +340,7 @@ ssmem_term()
  * 
  */
 inline void 
-ssmem_ts_next()
+ssmem_ts_next(void)
 {
   ssmem_ts_local->version++;
 }
@@ -434,7 +434,7 @@ ssmem_alloc(ssmem_allocator_t* a, size_t size)
 	  a->mem_chunks = ssmem_list_node_new(a->mem, a->mem_chunks);
 	}
 
-      m = a->mem + a->mem_curr;
+      m = (char*)a->mem + a->mem_curr;
       a->mem_curr += size;
     }
 
@@ -644,7 +644,7 @@ ssmem_free_list_print(ssmem_allocator_t* a)
   ssmem_free_set_t* cur = a->free_set_list;
   while (cur != NULL)
     {
-      printf("(%-3d | %p::", n++, cur);
+      printf("(%-3d | %p::", n++, (void*)cur);
       ssmem_ts_set_print_no_newline(cur->ts_set);
       printf(") -> \n");
       cur = cur->set_next;
@@ -664,7 +664,7 @@ ssmem_collected_list_print(ssmem_allocator_t* a)
   ssmem_free_set_t* cur = a->collected_set_list;
   while (cur != NULL)
     {
-      printf("(%-3d | %p::", n++, cur);
+      printf("(%-3d | %p::", n++, (void*)cur);
       ssmem_ts_set_print_no_newline(cur->ts_set);
       printf(") -> \n");
       cur = cur->set_next;
@@ -684,7 +684,7 @@ ssmem_available_list_print(ssmem_allocator_t* a)
   ssmem_free_set_t* cur = a->available_set_list;
   while (cur != NULL)
     {
-      printf("(%-3d | %p::", n++, cur);
+      printf("(%-3d | %p::", n++, (void*)cur);
       ssmem_ts_set_print_no_newline(cur->ts_set);
       printf(") -> \n");
       cur = cur->set_next;
@@ -706,7 +706,7 @@ ssmem_all_list_print(ssmem_allocator_t* a, int id)
  *
  */
 void
-ssmem_ts_list_print()
+ssmem_ts_list_print(void)
 {
   printf("[ALLOC] ts list (%u elems): ", ssmem_ts_list_len);
   ssmem_ts_t* cur = ssmem_ts_list;

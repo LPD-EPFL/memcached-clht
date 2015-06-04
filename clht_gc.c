@@ -74,7 +74,7 @@ clht_gc_thread_version(clht_hashtable_t* h)
  * operation.
  */
 inline void
-clht_gc_thread_version_max()
+clht_gc_thread_version_max(void)
 {
   clht_ts_thread->version = -1;
 }
@@ -84,7 +84,7 @@ clht_gc_thread_version_max()
  * get the GC id of the current thread
  */
 inline int 
-clht_gc_get_id()
+clht_gc_get_id(void)
 {
   return clht_ts_thread->id;
 }

@@ -49,15 +49,9 @@ __thread size_t check_ht_status_steps = CLHT_STATUS_INVOK_IN;
 #include "assert.h"
 
 const char*
-clht_type_desc()
+clht_type_desc(void)
 {
   return "CLHT-LB-RESIZE";
-}
-
-inline int
-is_power_of_two (unsigned int x) 
-{
-  return ((x != 0) && !(x & (x - 1)));
 }
 
 static inline
@@ -66,24 +60,9 @@ int is_odd (int x)
   return x & 1;
 }
 
-/** Jenkins' hash function for 64-bit integers. */
-inline uint64_t
-__ac_Jenkins_hash_64(uint64_t key)
-{
-  key += ~(key << 32);
-  key ^= (key >> 22);
-  key += ~(key << 13);
-  key ^= (key >> 8);
-  key += (key << 3);
-  key ^= (key >> 15);
-  key += ~(key << 27);
-  key ^= (key >> 31);
-  return key;
-}
-
 /* Create a new bucket. */
 bucket_t*
-clht_bucket_create() 
+clht_bucket_create(void) 
 {
   bucket_t* bucket = NULL;
   bucket = memalign(CACHE_LINE_SIZE, sizeof(bucket_t));
@@ -104,7 +83,7 @@ clht_bucket_create()
   return bucket;
 }
 
-bucket_t*
+static bucket_t*
 clht_bucket_create_stats(clht_hashtable_t* h, int* resize) 
 {
   bucket_t* b = clht_bucket_create();
@@ -115,8 +94,6 @@ clht_bucket_create_stats(clht_hashtable_t* h, int* resize)
     }
   return b;
 }
-
-clht_hashtable_t* clht_hashtable_create(uint32_t num_buckets);
 
 clht_t* 
 clht_create(uint32_t num_buckets)
