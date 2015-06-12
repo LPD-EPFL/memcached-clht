@@ -559,6 +559,12 @@ extern int daemonize(int nochdir, int noclose);
 #include "hash.h"
 #include "util.h"
 
+#ifdef CLHT
+#define CLHT_UNUSED __attribute__ ((unused))
+#else
+#define CLHT_UNUSED
+#endif
+
 /*
  * Functions such as the libevent-related calls that need to do cross-thread
  * communication in multithreaded mode (rather than actually doing the work

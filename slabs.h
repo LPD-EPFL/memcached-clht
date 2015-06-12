@@ -36,6 +36,10 @@ void slabs_stats(ADD_STAT add_stats, void *c);
 /* Hints as to freespace in slab class */
 unsigned int slabs_available_chunks(unsigned int id, bool *mem_flag, unsigned int *total_chunks);
 
+#ifdef CLHT
+void* slabs_get_slot_at_index(unsigned int index, unsigned int id);
+#endif
+
 int start_slab_maintenance_thread(void);
 void stop_slab_maintenance_thread(void);
 

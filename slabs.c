@@ -460,6 +460,29 @@ unsigned int slabs_available_chunks(const unsigned int id, bool *mem_flag,
     return ret;
 }
 
+#ifdef CLHT
+void* slabs_get_slot_at_index(unsigned int index, unsigned int id) {
+    slabclass_t* p;
+    char* ret = NULL;
+
+    pthread_mutex_lock(&slabs_lock);
+    p = &slabclass[id];
+
+    unsigned int total_slots = p->slabs * p->perslab;
+    if (index >= total_slots)
+        return NULL;
+
+    unsigned int slab_index = index / p->perslab;
+    unsigned int slot_index = index % p->perslab;
+
+    ret = (char*)p->slab_list[slab_index] + slot_index*p->size;
+
+    pthread_mutex_unlock(&slabs_lock);
+
+    return (void*)ret;
+}
+#endif
+
 static pthread_cond_t slab_rebalance_cond = PTHREAD_COND_INITIALIZER;
 static volatile int do_run_slab_thread = 1;
 static volatile int do_run_slab_rebalance_thread = 1;

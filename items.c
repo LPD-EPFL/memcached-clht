@@ -151,33 +151,45 @@ static size_t item_make_header(const uint8_t nkey, const int flags, const int nb
 }
 
 #ifdef CLHT
-static int evict(unsigned int id, const uint32_t cur_hv) {
+static int evict(const unsigned int id, const unsigned int total_chunks, const uint32_t cur_hv) {
     if (id == 0)
         return 0;
 
-    id |= COLD_LRU;
+    static unsigned long x = 123456789, y = 362436069, z = 521288629; // seeds
+    while (1) {
+        // inlined Marsaglia's xorshf rng
+        unsigned long t;
+        x ^= x << 16;
+        x ^= x >> 5;
+        x ^= x << 1;
 
-    pthread_mutex_lock(&lru_locks[id]);
-    item* search = tails[id];
+        t = x;
+        x = y;
+        y = z;
+        z = t ^ x ^ y;
 
-    // Search for item from tail and skip ourselves
-    while (search != NULL) {
-        uint32_t hv = hash(ITEM_key(search), search->nkey);
-        if (hv == cur_hv) {
-            search = search->prev;
+        unsigned long victim = z % total_chunks;
+
+        item* victim_it = slabs_get_slot_at_index(victim, id);
+        assert(victim_it);
+
+        uint32_t hv = hash(ITEM_key(victim_it), victim_it->nkey);
+        if (hv == cur_hv)
             continue;
+
+        if ((victim_it->it_flags & ITEM_LINKED) != 0) {
+            // Evicted count is approximate since multiple threads can
+            // pick the same item to evict and get here
+#ifdef HAVE_GCC_ATOMICS
+            __sync_fetch_and_add(&itemstats[id].evicted, 1);
+#else
+            itemstats[id].evicted++;
+#endif
+            do_item_unlink(victim_it, hv);
+            break;
         }
-
-        // We can try to evict the same item multiple times, in which case evicted count
-        // will not be accurate.
-        itemstats[id].evicted++;
-        do_item_unlink_nolock(search, hv);
-        break;
     }
-
-    pthread_mutex_unlock(&lru_locks[id]);
-
-    return search != NULL;
+    return 1;
 }
 #endif
 
@@ -237,7 +249,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
     // Evict from cache until we manage to allocate
     while (it == NULL) {
         // If eviction fails, out of memory error will be returned
-        if (!evict(id, cur_hv))
+        if (!evict(id, total_chunks, cur_hv))
             break;
         it = slabs_alloc(ntotal, id, &total_chunks);
     }
@@ -312,7 +324,7 @@ bool item_size_ok(const size_t nkey, const int flags, const int nbytes) {
     return slabs_clsid(ntotal) != 0;
 }
 
-static void do_item_link_q(item *it) { /* item is the new head */
+CLHT_UNUSED static void do_item_link_q(item *it) { /* item is the new head */
     item **head, **tail;
     assert((it->it_flags & ITEM_SLABBED) == 0);
 
@@ -330,9 +342,11 @@ static void do_item_link_q(item *it) { /* item is the new head */
 }
 
 static void item_link_q(item *it) {
+#ifndef CLHT
     pthread_mutex_lock(&lru_locks[it->slabs_clsid]);
     do_item_link_q(it);
     pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
+#endif
 }
 
 static void do_item_unlink_q(item *it) {
@@ -358,9 +372,11 @@ static void do_item_unlink_q(item *it) {
 }
 
 static void item_unlink_q(item *it) {
+#ifndef CLHT
     pthread_mutex_lock(&lru_locks[it->slabs_clsid]);
     do_item_unlink_q(it);
     pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
+#endif
 }
 
 int do_item_link(item *it, const uint32_t hv) {
@@ -505,8 +521,8 @@ void do_item_unlink(item *it, const uint32_t hv) {
 
 /* FIXME: Is it necessary to keep this copy/pasted code? */
 void do_item_unlink_nolock(item *it, const uint32_t hv) {
-    MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
 #ifndef CLHT
+    MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
     if ((it->it_flags & ITEM_LINKED) != 0) {
         it->it_flags &= ~ITEM_LINKED;
         STATS_LOCK();
@@ -518,22 +534,7 @@ void do_item_unlink_nolock(item *it, const uint32_t hv) {
         do_item_remove(it);
     }
 #else
-    // Same as item_unlink, except for nolock version of item_unlink
-    assert((it->it_flags & ITEM_LINKED) != 0);
-
-    int success = assoc_delete(ITEM_key(it), it->nkey, hv);
-
-    if (success) {
-        do_item_unlink_q(it);
-        it->it_flags &= ~ITEM_LINKED;
-
-        STATS_LOCK();
-        stats.curr_bytes -= ITEM_ntotal(it);
-        stats.curr_items -= 1;
-        STATS_UNLOCK();
-
-        do_item_remove(it);
-    }
+    do_item_unlink(it, hv);
 #endif
 }
 
@@ -569,6 +570,7 @@ void do_item_update_nolock(item *it) {
 
 /* Bump the last accessed time, or relink if we're in compat mode */
 void do_item_update(item *it) {
+#ifndef CLHT
     MEMCACHED_ITEM_UPDATE(ITEM_key(it), it->nkey, it->nbytes);
     if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
         assert((it->it_flags & ITEM_SLABBED) == 0);
@@ -581,6 +583,10 @@ void do_item_update(item *it) {
             }
         }
     }
+#else
+    // TODO: Noop for now because we use random eviction policy, update once
+    //       we change policy to something that requires updates
+#endif
 }
 
 int do_item_replace(item *it, item *new_it, const uint32_t hv) {
