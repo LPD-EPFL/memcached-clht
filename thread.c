@@ -373,6 +373,9 @@ static void *worker_libevent(void *arg) {
     /* Any per-thread setup can happen here; memcached_thread_init() will block until
      * all threads have finished initializing.
      */
+#ifdef CLHT
+    assoc_thread_init(me->thread_index);
+#endif
 
     register_thread_initialized();
 
@@ -782,6 +785,10 @@ void memcached_thread_init(int nthreads, struct event_base *main_base) {
             perror("Can't create notify pipe");
             exit(1);
         }
+
+#ifdef CLHT
+        threads[i].thread_index = i;
+#endif
 
         threads[i].notify_receive_fd = fds[0];
         threads[i].notify_send_fd = fds[1];

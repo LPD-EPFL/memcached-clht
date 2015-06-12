@@ -25,10 +25,6 @@
 #include <assert.h>
 #include <pthread.h>
 
-static pthread_cond_t maintenance_cond = PTHREAD_COND_INITIALIZER;
-static pthread_mutex_t maintenance_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t hash_items_counter_lock = PTHREAD_MUTEX_INITIALIZER;
-
 typedef  unsigned long  int  ub4;   /* unsigned 4-byte quantities */
 typedef  unsigned       char ub1;   /* unsigned 1-byte quantities */
 
@@ -37,6 +33,12 @@ unsigned int hashpower = HASHPOWER_DEFAULT;
 
 #define hashsize(n) ((ub4)1<<(n))
 #define hashmask(n) (hashsize(n)-1)
+
+#ifndef CLHT
+
+static pthread_cond_t maintenance_cond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t maintenance_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t hash_items_counter_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Main hash table. This is where we look except during expansion. */
 static item** primary_hashtable = 0;
@@ -179,7 +181,7 @@ int assoc_insert(item *it, const uint32_t hv) {
     return 1;
 }
 
-void assoc_delete(const char *key, const size_t nkey, const uint32_t hv) {
+int assoc_delete(const char *key, const size_t nkey, const uint32_t hv) {
     item **before = _hashitem_before(key, nkey, hv);
 
     if (*before) {
@@ -194,11 +196,12 @@ void assoc_delete(const char *key, const size_t nkey, const uint32_t hv) {
         nxt = (*before)->h_next;
         (*before)->h_next = 0;   /* probably pointless, but whatever. */
         *before = nxt;
-        return;
+        return 1;
     }
     /* Note:  we never actually get here.  the callers don't delete things
        they can't find. */
     assert(*before != 0);
+    return 0;
 }
 
 
@@ -304,3 +307,98 @@ void stop_assoc_maintenance_thread() {
     pthread_join(maintenance_tid, NULL);
 }
 
+#else // #ifndef CLHT
+
+static clht_t* hashtable = NULL;
+static __thread ssmem_allocator_t* obj_alloc = NULL;
+
+void assoc_init(const int hashtable_init) {
+    if (hashtable_init) {
+        hashpower = hashtable_init;
+    }
+
+    hashtable = clht_create(hashsize(hashpower));
+    if (!hashtable) {
+        fprintf(stderr, "Failed to init hashtable.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    STATS_LOCK();
+    stats.hash_power_level = hashpower;
+    // TODO: figure out the hash_bytes number for clht
+    stats.hash_bytes = hashsize(hashpower) * sizeof(void*);
+    STATS_UNLOCK();
+}
+
+/* This function needs to be called by the worker threads before they start working */
+void assoc_thread_init(int thread_id) {
+    clht_gc_thread_init(hashtable, thread_id);
+    obj_alloc = (ssmem_allocator_t*)malloc(sizeof(ssmem_allocator_t));
+    if (!obj_alloc) {
+        fprintf(stderr, "Failed to init clht object allocator.\n");
+        exit(EXIT_FAILURE);
+    }
+    ssmem_alloc_init_fs_size(obj_alloc, SSMEM_DEFAULT_MEM_SIZE, SSMEM_GC_FREE_SET_SIZE, thread_id);
+}
+
+item* assoc_find(const char* key, const size_t nkey, const uint32_t hv) {
+    clht_val_t res = clht_get(hashtable->ht, hv);
+    
+    item* it = (item*)res;
+    assert(nkey == it->nkey);
+    assert(memcmp(key, ITEM_key(it), nkey) == 0);
+
+    return it;
+}
+
+int assoc_insert(item* it, const uint32_t hv) {
+    void* ptr = ssmem_alloc(obj_alloc, sizeof(void*));
+    ptr = it;
+
+    int success = clht_put(hashtable, (clht_addr_t)hv, (clht_val_t)ptr);
+
+    if (!success) {
+        ssmem_free(obj_alloc, ptr);
+    }
+    return success;
+}
+
+/* Returns the old item if it exists */
+item* assoc_replace(item* it, const uint32_t hv) {
+    void* ptr = ssmem_alloc(obj_alloc, sizeof(void*));
+    ptr = it;
+
+    clht_val_t res = clht_set(hashtable, (clht_addr_t)hv, (clht_val_t)ptr);
+
+    if (res) {
+        item* res_it = (item*)res;
+        ssmem_free(obj_alloc, (void*)res);
+        return res_it;
+    }
+    return NULL;
+}
+
+int assoc_delete(const char* key, const size_t nkey, const uint32_t hv) {
+    clht_val_t res = clht_remove(hashtable, hv);
+
+    if (res) {
+      item* it = (item*)res;
+      assert(nkey == it->nkey);
+      assert(memcmp(key, ITEM_key(it), nkey) == 0);
+      (void)it;
+
+      ssmem_free(obj_alloc, (void*)res);
+
+      return 1;
+    }
+    return 0;
+}
+
+int start_assoc_maintenance_thread() {
+    return 0;
+}
+
+void stop_assoc_maintenance_thread() {
+}
+
+#endif // #ifndef CLHT
