@@ -151,23 +151,35 @@ int refcount_acquire(unsigned short* refcount) {
  */
 
 void item_lock(uint32_t hv) {
+#ifndef CLHT
     mutex_lock(&item_locks[hv & hashmask(item_lock_hashpower)]);
+#endif
 }
 
 void *item_trylock(uint32_t hv) {
+#ifdef CLHT
+    // Shouldn't be called in CLHT mode
+    assert(false);
+    return NULL;
+#else
     pthread_mutex_t *lock = &item_locks[hv & hashmask(item_lock_hashpower)];
     if (pthread_mutex_trylock(lock) == 0) {
         return lock;
     }
     return NULL;
+#endif
 }
 
 void item_trylock_unlock(void *lock) {
+#ifndef CLHT
     mutex_unlock((pthread_mutex_t *) lock);
+#endif
 }
 
 void item_unlock(uint32_t hv) {
+#ifndef CLHT
     mutex_unlock(&item_locks[hv & hashmask(item_lock_hashpower)]);
+#endif
 }
 
 static void wait_for_thread_registration(int nthreads) {

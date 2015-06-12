@@ -160,11 +160,10 @@ static int evict(unsigned int id, const uint32_t cur_hv) {
     pthread_mutex_lock(&lru_locks[id]);
     item* search = tails[id];
 
-    // Search continues until the first non-locked item from the tail; also skip ourselves
+    // Search for item from tail and skip ourselves
     while (search != NULL) {
         uint32_t hv = hash(ITEM_key(search), search->nkey);
-        void* hold_lock = NULL;
-        if (hv == cur_hv || (hold_lock = item_trylock(hv)) == NULL) {
+        if (hv == cur_hv) {
             search = search->prev;
             continue;
         }
@@ -173,7 +172,6 @@ static int evict(unsigned int id, const uint32_t cur_hv) {
         // will not be accurate.
         itemstats[id].evicted++;
         do_item_unlink_nolock(search, hv);
-        item_trylock_unlock(hold_lock);
         break;
     }
 
