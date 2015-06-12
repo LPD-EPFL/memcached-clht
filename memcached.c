@@ -2394,14 +2394,29 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
         }
 
         if (stored == NOT_STORED) {
-            if (old_it != NULL)
+#ifndef CLHT
+            if (old_it != NULL)                // set
                 item_replace(old_it, it, hv);
-            else
+            else                               // set or add
                 do_item_link(it, hv);
 
             c->cas = ITEM_get_cas(it);
-
             stored = STORED;
+#else
+            if (comm == NREAD_SET) {
+                do_item_set(it, hv);
+
+                c->cas = ITEM_get_cas(it);
+                stored = STORED;
+            } else { // comm == NREAD_ADD
+                assert(comm == NREAD_ADD);
+
+                if (do_item_add(it, hv)) {
+                    c->cas = ITEM_get_cas(it);
+                    stored = STORED;
+                }
+            }
+#endif
         }
     }
 

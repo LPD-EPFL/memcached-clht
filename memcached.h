@@ -595,6 +595,9 @@ void item_unlock(uint32_t hv);
 void pause_threads(enum pause_thread_types type);
 unsigned short refcount_incr(unsigned short *refcount);
 unsigned short refcount_decr(unsigned short *refcount);
+//#ifdef CLHT
+int refcount_acquire(unsigned short* refcount);
+//#endif
 void STATS_LOCK(void);
 void STATS_UNLOCK(void);
 void threadlocal_stats_reset(void);

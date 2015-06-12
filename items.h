@@ -13,6 +13,10 @@ void do_item_remove(item *it);
 void do_item_update(item *it);   /** update LRU time to current and reposition */
 void do_item_update_nolock(item *it);
 int  do_item_replace(item *it, item *new_it, const uint32_t hv);
+#ifdef CLHT
+void do_item_set(item *it, const uint32_t hv);
+int  do_item_add(item *it, const uint32_t hv);
+#endif
 
 /*@null@*/
 char *item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, unsigned int *bytes);

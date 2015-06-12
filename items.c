@@ -150,10 +150,42 @@ static size_t item_make_header(const uint8_t nkey, const int flags, const int nb
     return sizeof(item) + nkey + *nsuffix + nbytes;
 }
 
+#ifdef CLHT
+static int evict(unsigned int id, const uint32_t cur_hv) {
+    if (id == 0)
+        return 0;
+
+    id |= COLD_LRU;
+
+    pthread_mutex_lock(&lru_locks[id]);
+    item* search = tails[id];
+
+    // Search continues until the first non-locked item from the tail; also skip ourselves
+    while (search != NULL) {
+        uint32_t hv = hash(ITEM_key(search), search->nkey);
+        void* hold_lock = NULL;
+        if (hv == cur_hv || (hold_lock = item_trylock(hv)) == NULL) {
+            search = search->prev;
+            continue;
+        }
+
+        // We can try to evict the same item multiple times, in which case evicted count
+        // will not be accurate.
+        itemstats[id].evicted++;
+        do_item_unlink_nolock(search, hv);
+        item_trylock_unlock(hold_lock);
+        break;
+    }
+
+    pthread_mutex_unlock(&lru_locks[id]);
+
+    return search != NULL;
+}
+#endif
+
 item *do_item_alloc(char *key, const size_t nkey, const int flags,
                     const rel_time_t exptime, const int nbytes,
                     const uint32_t cur_hv) {
-    int i;
     uint8_t nsuffix;
     item *it = NULL;
     char suffix[40];
@@ -167,12 +199,14 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
     if (id == 0)
         return 0;
 
+#ifndef CLHT
     /* If no memory is available, attempt a direct LRU juggle/eviction */
     /* This is a race in order to simplify lru_pull_tail; in cases where
      * locked items are on the tail, you want them to fall out and cause
      * occasional OOM's, rather than internally work around them.
      * This also gives one fewer code path for slab alloc/free
      */
+    int i;
     for (i = 0; i < 5; i++) {
         /* Try to reclaim memory first */
         if (!settings.lru_maintainer_thread) {
@@ -199,6 +233,17 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
         itemstats[id].direct_reclaims += i;
         pthread_mutex_unlock(&lru_locks[id]);
     }
+#else
+    it = slabs_alloc(ntotal, id, &total_chunks);
+
+    // Evict from cache until we manage to allocate
+    while (it == NULL) {
+        // If eviction fails, out of memory error will be returned
+        if (!evict(id, cur_hv))
+            break;
+        it = slabs_alloc(ntotal, id, &total_chunks);
+    }
+#endif
 
     if (it == NULL) {
         pthread_mutex_lock(&lru_locks[id]);
@@ -321,6 +366,10 @@ static void item_unlink_q(item *it) {
 }
 
 int do_item_link(item *it, const uint32_t hv) {
+#ifdef CLHT
+    // Shouldn't be called in CLHT mode
+    assert(false);
+#endif
     MEMCACHED_ITEM_LINK(ITEM_key(it), it->nkey, it->nbytes);
     assert((it->it_flags & (ITEM_LINKED|ITEM_SLABBED)) == 0);
     it->it_flags |= ITEM_LINKED;
@@ -341,8 +390,88 @@ int do_item_link(item *it, const uint32_t hv) {
     return 1;
 }
 
+#ifdef CLHT
+void do_item_set(item *it, const uint32_t hv) {
+    assert((it->it_flags & (ITEM_LINKED|ITEM_SLABBED)) == 0);
+
+    refcount_incr(&it->refcount);
+
+    it->it_flags |= ITEM_LINKED;
+    it->time = current_time;
+    ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
+
+    STATS_LOCK();
+    stats.curr_bytes += ITEM_ntotal(it);
+    stats.curr_items += 1;
+    stats.total_items += 1;
+    STATS_UNLOCK();
+
+    item_link_q(it);
+
+    // assoc_replace must go last because that is the synchronization point.
+    // Item is freshly allocated, so there is no need for it to be locked before insertion.
+    // If an item already exists for the key, assoc_replace will evict it, and it needs
+    // to be deleted.
+ 
+    item* old_it = assoc_replace(it, hv);
+
+    if (old_it) {
+        item_unlink_q(old_it);
+        old_it->it_flags &= ~ITEM_LINKED;
+
+        STATS_LOCK();
+        stats.curr_bytes -= ITEM_ntotal(old_it);
+        stats.curr_items -= 1;
+        STATS_UNLOCK();
+
+        do_item_remove(old_it);
+    }
+}
+
+int do_item_add(item *it, const uint32_t hv) {
+    assert((it->it_flags & (ITEM_LINKED|ITEM_SLABBED)) == 0);
+
+    refcount_incr(&it->refcount);
+
+    it->it_flags |= ITEM_LINKED;
+    it->time = current_time;
+    ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
+
+    item_link_q(it);
+
+    // assoc_insert must go last because that is the synchronization point.
+    // Item is freshly allocated, so there is no need for it to be locked before insertion.
+    // Since insertion can fail if there are concurrent adds/sets for the same key, we
+    // need to undo changes to item (refcount, flags), so it can be freed by the caller.
+    // cas_id may end up being wasted if the insert fails, but it doesn't matter.
+
+    int success = assoc_insert(it, hv);
+ 
+    if (success) {
+        // Actually this also needs to be done before insert, and undone if it fails,
+        // but for now I don't care
+        STATS_LOCK();
+        stats.curr_bytes += ITEM_ntotal(it);
+        stats.curr_items += 1;
+        stats.total_items += 1;
+        STATS_UNLOCK();
+    } else {
+        item_unlink_q(it);
+        it->it_flags &= ~ITEM_LINKED;
+        refcount_decr(&it->refcount);
+
+        // The protocol says that item should be updated on failed add, but the only way
+        // for the add to fail here is if there was a concurrent set/add that was faster,
+        // so there is really no need to update.
+    }
+
+    return success;
+}
+#endif
+
 void do_item_unlink(item *it, const uint32_t hv) {
     MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
+#ifndef CLHT
     if ((it->it_flags & ITEM_LINKED) != 0) {
         it->it_flags &= ~ITEM_LINKED;
         STATS_LOCK();
@@ -353,11 +482,33 @@ void do_item_unlink(item *it, const uint32_t hv) {
         item_unlink_q(it);
         do_item_remove(it);
     }
+#else
+    // assoc_delete must go first because that is the synchronization point.
+    // Only a single concurrent delete can succeed.
+    // Item can still be used by other threads (readers), but they either don't touch the
+    // fields changed here (flags) or the fields are atomic (refcount).
+    assert((it->it_flags & ITEM_LINKED) != 0);
+
+    int success = assoc_delete(ITEM_key(it), it->nkey, hv);
+
+    if (success) {
+        item_unlink_q(it);
+        it->it_flags &= ~ITEM_LINKED;
+
+        STATS_LOCK();
+        stats.curr_bytes -= ITEM_ntotal(it);
+        stats.curr_items -= 1;
+        STATS_UNLOCK();
+
+        do_item_remove(it);
+    }
+#endif
 }
 
 /* FIXME: Is it necessary to keep this copy/pasted code? */
 void do_item_unlink_nolock(item *it, const uint32_t hv) {
     MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
+#ifndef CLHT
     if ((it->it_flags & ITEM_LINKED) != 0) {
         it->it_flags &= ~ITEM_LINKED;
         STATS_LOCK();
@@ -368,6 +519,24 @@ void do_item_unlink_nolock(item *it, const uint32_t hv) {
         do_item_unlink_q(it);
         do_item_remove(it);
     }
+#else
+    // Same as item_unlink, except for nolock version of item_unlink
+    assert((it->it_flags & ITEM_LINKED) != 0);
+
+    int success = assoc_delete(ITEM_key(it), it->nkey, hv);
+
+    if (success) {
+        do_item_unlink_q(it);
+        it->it_flags &= ~ITEM_LINKED;
+
+        STATS_LOCK();
+        stats.curr_bytes -= ITEM_ntotal(it);
+        stats.curr_items -= 1;
+        STATS_UNLOCK();
+
+        do_item_remove(it);
+    }
+#endif
 }
 
 void do_item_remove(item *it) {
@@ -376,6 +545,7 @@ void do_item_remove(item *it) {
     assert(it->refcount > 0);
 
     if (refcount_decr(&it->refcount) == 0) {
+        assert((it->it_flags & ITEM_LINKED) == 0);
         item_free(it);
     }
 }
@@ -383,6 +553,7 @@ void do_item_remove(item *it) {
 /* Copy/paste to avoid adding two extra branches for all common calls, since
  * _nolock is only used in an uncommon case where we want to relink. */
 void do_item_update_nolock(item *it) {
+#ifndef CLHT
     MEMCACHED_ITEM_UPDATE(ITEM_key(it), it->nkey, it->nbytes);
     if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
         assert((it->it_flags & ITEM_SLABBED) == 0);
@@ -393,6 +564,9 @@ void do_item_update_nolock(item *it) {
             do_item_link_q(it);
         }
     }
+#else
+    do_item_update(it);
+#endif
 }
 
 /* Bump the last accessed time, or relink if we're in compat mode */
@@ -412,6 +586,10 @@ void do_item_update(item *it) {
 }
 
 int do_item_replace(item *it, item *new_it, const uint32_t hv) {
+#ifdef CLHT
+    // Shouldn't be called in CLHT mode
+    assert(false);
+#endif
     MEMCACHED_ITEM_REPLACE(ITEM_key(it), it->nkey, it->nbytes,
                            ITEM_key(new_it), new_it->nkey, new_it->nbytes);
     assert((it->it_flags & ITEM_SLABBED) == 0);
@@ -674,7 +852,21 @@ void item_stats_sizes(ADD_STAT add_stats, void *c) {
 item *do_item_get(const char *key, const size_t nkey, const uint32_t hv) {
     item *it = assoc_find(key, nkey, hv);
     if (it != NULL) {
+#ifdef CLHT
+        /* Between getting the item pointer from the hashtable and here,
+           the item can be deleted, its refcount gone to zero, and the item
+           freed. In that case, we consider that get failed to find the 
+           item and return NULL.
+           Also, the item can be allocated again and its refcount above zero
+           again. In that case, we will return the wrong item.
+           TODO: fix this problem.
+         */
+        if (!refcount_acquire(&it->refcount))
+            it = NULL;
+#else
         refcount_incr(&it->refcount);
+#endif
+
         /* Optimization for slab reassignment. prevents popular items from
          * jamming in busy wait. Can only do this here to satisfy lock order
          * of item_lock, slabs_lock. */
@@ -712,6 +904,8 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv) {
     }
 
     if (it != NULL) {
+#ifndef CLHT
+        // TODO: Include this part back, changes to item need to be atomic
         if (is_flushed(it)) {
             do_item_unlink(it, hv);
             do_item_remove(it);
@@ -730,6 +924,7 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv) {
             it->it_flags |= ITEM_FETCHED|ITEM_ACTIVE;
             DEBUG_REFCNT(it, '+');
         }
+#endif
     }
 
     if (settings.verbose > 2)
