@@ -371,9 +371,9 @@ int clht_put(clht_t* hashtable, clht_addr_t key, clht_val_t val);
 /* Insert a key-value pair into a hashtable. Return old value if it existed */
 clht_val_t clht_set(clht_t* hashtable, clht_addr_t key, clht_val_t val);
 /* Retrieve a key-value pair from a hashtable. */
-clht_val_t clht_get(clht_hashtable_t* hashtable, clht_addr_t key);
+clht_val_t clht_get(clht_hashtable_t* hashtable, clht_addr_t key, const char* full_key, const size_t key_size);
 /* Remove a key-value pair from a hashtable. */
-clht_val_t clht_remove(clht_t* hashtable, clht_addr_t key);
+clht_val_t clht_remove(clht_t* hashtable, clht_addr_t key, const char* full_key, const size_t key_size);
 
 /* returns the size of the hash table */
 size_t clht_size(clht_hashtable_t* hashtable);

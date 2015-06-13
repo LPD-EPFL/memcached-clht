@@ -342,11 +342,13 @@ void assoc_thread_init(int thread_id) {
 }
 
 item* assoc_find(const char* key, const size_t nkey, const uint32_t hv) {
-    clht_val_t res = clht_get(hashtable->ht, hv);
+    clht_val_t res = clht_get(hashtable->ht, hv, key, nkey);
     
     item* it = (item*)res;
-    assert(nkey == it->nkey);
-    assert(memcmp(key, ITEM_key(it), nkey) == 0);
+    if (res) {
+        assert(nkey == it->nkey);
+        assert(memcmp(key, ITEM_key(it), nkey) == 0);
+    }
 
     return it;
 }
@@ -371,25 +373,27 @@ item* assoc_replace(item* it, const uint32_t hv) {
     clht_val_t res = clht_set(hashtable, (clht_addr_t)hv, (clht_val_t)ptr);
 
     if (res) {
-        item* res_it = (item*)res;
+        item* old_it = (item*)res;
+        assert(old_it->nkey == it->nkey);
+        assert(memcmp(ITEM_key(old_it), ITEM_key(it), old_it->nkey) == 0);
+
         ssmem_free(obj_alloc, (void*)res);
-        return res_it;
+        return old_it;
     }
     return NULL;
 }
 
 int assoc_delete(const char* key, const size_t nkey, const uint32_t hv) {
-    clht_val_t res = clht_remove(hashtable, hv);
+    clht_val_t res = clht_remove(hashtable, hv, key, nkey);
 
     if (res) {
-      item* it = (item*)res;
-      assert(nkey == it->nkey);
-      assert(memcmp(key, ITEM_key(it), nkey) == 0);
-      (void)it;
+        item* it = (item*)res;
+        assert(nkey == it->nkey);
+        assert(memcmp(key, ITEM_key(it), nkey) == 0);
+        (void)it;
 
-      ssmem_free(obj_alloc, (void*)res);
-
-      return 1;
+        ssmem_free(obj_alloc, (void*)res);
+        return 1;
     }
     return 0;
 }

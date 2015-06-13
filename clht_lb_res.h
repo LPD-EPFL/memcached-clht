@@ -472,10 +472,10 @@ int clht_put(clht_t* hashtable, clht_addr_t key, clht_val_t val);
 clht_val_t clht_set(clht_t* hashtable, clht_addr_t key, clht_val_t val);
 
 /* Retrieve a key-value pair from a hashtable. */
-clht_val_t clht_get(clht_hashtable_t* hashtable, clht_addr_t key);
+clht_val_t clht_get(clht_hashtable_t* hashtable, clht_addr_t key, const char* full_key, const size_t key_size);
 
 /* Remove a key-value pair from a hashtable. */
-clht_val_t clht_remove(clht_t* hashtable, clht_addr_t key);
+clht_val_t clht_remove(clht_t* hashtable, clht_addr_t key, const char* full_key, const size_t key_size);
 
 size_t clht_size(clht_hashtable_t* hashtable);
 size_t clht_size_mem(clht_hashtable_t* hashtable);

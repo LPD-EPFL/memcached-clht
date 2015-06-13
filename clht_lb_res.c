@@ -34,6 +34,7 @@
 #include <string.h>
 
 #include "clht_lb_res.h"
+#include "clht_util.h"
 
 __thread ssmem_allocator_t* clht_alloc;
 
@@ -195,7 +196,7 @@ clht_hash(clht_hashtable_t* hashtable, clht_addr_t key)
 
 /* Retrieve a key-value entry from a hash table. */
 clht_val_t
-clht_get(clht_hashtable_t* hashtable, clht_addr_t key)
+clht_get(clht_hashtable_t* hashtable, clht_addr_t key, const char* full_key, const size_t key_size)
 {
   size_t bin = clht_hash(hashtable, key);
   CLHT_GC_HT_VERSION_USED(hashtable);
@@ -210,7 +211,7 @@ clht_get(clht_hashtable_t* hashtable, clht_addr_t key)
 #ifdef __tile__
 	  _mm_lfence();
 #endif
-	  if (bucket->key[j] == key) 
+	  if ((bucket->key[j] == key) && keycmp_key_item(full_key, key_size, val))
 	    {
 	      if (likely(bucket->val[j] == val))
 		{
@@ -258,10 +259,10 @@ _clht_put(clht_t* h, clht_addr_t key, clht_val_t val, int replace)
   volatile bucket_t* bucket = hashtable->table + bin;
 
 #if CLHT_READ_ONLY_FAIL == 1
-  if (!replace && bucket_exists(bucket, key))
-    {
-      return false;
-    }
+//  if (!replace && bucket_exists(bucket, key))
+//    {
+//      return false;
+//    }
 #endif
 
   clht_lock_t* lock = &bucket->lock;
@@ -286,15 +287,18 @@ _clht_put(clht_t* h, clht_addr_t key, clht_val_t val, int replace)
 	{
 	  if (bucket->key[j] == key) 
 	    {
-              if (replace) {
-                clht_val_t oldval = bucket->val[j];
-                bucket->val[j] = val;
-                LOCK_RLS(lock);
-                return oldval;
-              } else {
-                LOCK_RLS(lock);
-                return false;
-              }
+              clht_val_t oldval = bucket->val[j];
+              if (keycmp_item_item(val, oldval))
+                {
+                  if (replace) {
+                    bucket->val[j] = val;
+                    LOCK_RLS(lock);
+                    return oldval;
+                  } else {
+                    LOCK_RLS(lock);
+                    return false;
+                  }
+                }
 	    }
 	  else if (empty == NULL && bucket->key[j] == 0)
 	    {
@@ -369,7 +373,7 @@ clht_set(clht_t* h, clht_addr_t key, clht_val_t val)
 
 /* Remove a key-value entry from a hash table. */
 clht_val_t
-clht_remove(clht_t* h, clht_addr_t key)
+clht_remove(clht_t* h, clht_addr_t key, const char* full_key, const size_t key_size)
 {
   clht_hashtable_t* hashtable = h->ht;
   size_t bin = clht_hash(hashtable, key);
@@ -403,9 +407,12 @@ clht_remove(clht_t* h, clht_addr_t key)
 	  if (bucket->key[j] == key) 
 	    {
 	      clht_val_t val = bucket->val[j];
-	      bucket->key[j] = 0;
-	      LOCK_RLS(lock);
-	      return val;
+              if (keycmp_key_item(full_key, key_size, val))
+                {
+	          bucket->key[j] = 0;
+	          LOCK_RLS(lock);
+	          return val;
+                }
 	    }
 	}
       bucket = bucket->next;
