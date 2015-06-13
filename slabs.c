@@ -556,7 +556,7 @@ static short firstzero[256] = {
 };
 
 void clock_update(item* it) {
-    unsigned int id = it->slabs_clsid;
+    unsigned int id = ITEM_clsid(it);
     assert(id >= POWER_SMALLEST && id <= power_largest);
     if (id < POWER_SMALLEST || id > power_largest)
         return;
