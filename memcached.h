@@ -362,7 +362,9 @@ typedef struct _stritem {
     struct _stritem *next;
     struct _stritem *prev;
     /* Rest are protected by an item lock */
+#ifndef CLHT
     struct _stritem *h_next;    /* hash chain next */
+#endif
     rel_time_t      time;       /* least recent access */
     rel_time_t      exptime;    /* expire time */
     int             nbytes;     /* size of data */
@@ -370,6 +372,9 @@ typedef struct _stritem {
     uint8_t         nsuffix;    /* length of flags-and-length string */
     uint8_t         it_flags;   /* ITEM_* above */
     uint8_t         slabs_clsid;/* which slab class we're in */
+#ifdef CLHT
+    unsigned int    slabs_index;/* index within slab class */
+#endif
     uint8_t         nkey;       /* key length, w/terminating null and padding */
     /* this odd type prevents type-punning issues when we do
      * the little shuffle to save space when not using CAS. */

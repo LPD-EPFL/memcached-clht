@@ -37,6 +37,11 @@ typedef struct {
 
     unsigned int killing;  /* index+1 of dying slab, or zero if none */
     size_t requested; /* The number of requested bytes */
+
+#ifdef CLHT
+    char* bitmap;             /* bit per slot for clock alg. */
+    unsigned int clock_hand;  /* current slot for clock alg. */
+#endif
 } slabclass_t;
 
 static slabclass_t slabclass[MAX_NUMBER_OF_SLAB_CLASSES];
@@ -195,6 +200,39 @@ static void split_slab_page_into_freelist(char *ptr, const unsigned int id) {
     }
 }
 
+#ifdef CLHT
+// Initial contents of bitmap don't matter, since we set bit when item is used
+static int clock_grow_bitmap(const unsigned int id) {
+    slabclass_t* p = &slabclass[id];
+    unsigned int total_slots = (p->slabs + 1) * p->perslab;
+    unsigned int bitmap_size = (total_slots + 7) / 8;
+
+    if (p->bitmap == NULL) {
+        p->bitmap = (char*)malloc(bitmap_size);
+        if (p->bitmap == NULL)
+            return 0;
+    } else {
+        char* new_bitmap = realloc(p->bitmap, bitmap_size);
+        if (new_bitmap == NULL)
+            return 0;
+        p->bitmap = new_bitmap;
+    }
+    return 1;
+}
+
+static void set_item_indices(char *ptr, const unsigned int id) {
+    slabclass_t* p = &slabclass[id];
+    unsigned int current_items = p->slabs * p->perslab;
+
+    int i;
+    for (i = 0; i < p->perslab; i++) {
+        item* it = (item*)ptr;
+        it->slabs_index = current_items + i;
+        ptr += p->size;
+    }
+}
+#endif
+
 static int do_slabs_newslab(const unsigned int id) {
     slabclass_t *p = &slabclass[id];
     int len = settings.slab_reassign ? settings.item_size_max
@@ -208,6 +246,9 @@ static int do_slabs_newslab(const unsigned int id) {
     }
 
     if ((grow_slab_list(id) == 0) ||
+#ifdef CLHT
+        (clock_grow_bitmap(id) == 0) ||
+#endif
         ((ptr = memory_allocate((size_t)len)) == 0)) {
 
         MEMCACHED_SLABS_SLABCLASS_ALLOCATE_FAILED(id);
@@ -216,6 +257,9 @@ static int do_slabs_newslab(const unsigned int id) {
 
     memset(ptr, 0, (size_t)len);
     split_slab_page_into_freelist(ptr, id);
+#ifdef CLHT
+    set_item_indices(ptr, id);
+#endif
 
     p->slab_list[p->slabs++] = ptr;
     mem_malloced += len;
@@ -461,25 +505,145 @@ unsigned int slabs_available_chunks(const unsigned int id, bool *mem_flag,
 }
 
 #ifdef CLHT
-void* slabs_get_slot_at_index(unsigned int index, unsigned int id) {
-    slabclass_t* p;
-    char* ret = NULL;
+static inline int clock_get_bit(char* bitmap, unsigned int index) {
+    unsigned int byte_index = index >> 3;  // index / 8
+    char mask = 1 << (index & 7);          // index % 8
+    return bitmap[byte_index] & mask;
+}
 
-    pthread_mutex_lock(&slabs_lock);
-    p = &slabclass[id];
+static inline void clock_set_bit(char* bitmap, unsigned int index) {
+    unsigned int byte_index = index >> 3;
+    char mask = 1 << (index & 7);
+    bitmap[byte_index] |= mask;
+}
 
-    unsigned int total_slots = p->slabs * p->perslab;
-    if (index >= total_slots)
-        return NULL;
+static inline void clock_reset_bit(char* bitmap, unsigned int index) {
+    unsigned int byte_index = index >> 3;
+    char mask = ~(1 << (index & 7));
+    bitmap[byte_index] &= mask;
+}
+
+static void* slabs_get_slot_at_index(unsigned int index, unsigned int id) {
+    slabclass_t* p = &slabclass[id];
+
+    assert(index < p->slabs * p->perslab);
 
     unsigned int slab_index = index / p->perslab;
     unsigned int slot_index = index % p->perslab;
 
-    ret = (char*)p->slab_list[slab_index] + slot_index*p->size;
+    char* ret = (char*)p->slab_list[slab_index] + slot_index*p->size;
+
+    return (void*)ret;
+}
+
+static short firstzero[256] = {
+    0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4,
+    0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 5,
+    0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4,
+    0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 6,
+    0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4,
+    0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 5,
+    0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4,
+    0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 7,
+    0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4,
+    0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 5,
+    0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4,
+    0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 6,
+    0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4,
+    0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 5,
+    0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4,
+    0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 8
+};
+
+void clock_update(item* it) {
+    unsigned int id = it->slabs_clsid;
+    assert(id >= POWER_SMALLEST && id <= power_largest);
+    if (id < POWER_SMALLEST || id > power_largest)
+        return;
+
+    slabclass_t* p = &slabclass[id];
+    clock_set_bit(p->bitmap, it->slabs_index);
+}
+
+item* clock_get_victim(unsigned int id) {
+    slabclass_t* p = &slabclass[id];
+
+    pthread_mutex_lock(&slabs_lock);
+
+    unsigned int total_slots = p->slabs * p->perslab;
+    assert(p->clock_hand < total_slots);
+
+    while (1) {
+        int victim_found = 0;
+        p->clock_hand++;
+
+        // If there is less than a byte left until the end of bitmap
+        unsigned int slots_left = total_slots - p->clock_hand - 1;
+        if (slots_left < 8) {
+            while (slots_left) {
+                if (clock_get_bit(p->bitmap, p->clock_hand)) {
+                    clock_reset_bit(p->bitmap, p->clock_hand);
+                } else {
+                    victim_found = 1;
+                    break;
+                }
+                p->clock_hand++;
+                slots_left--;
+            }
+            if (victim_found)
+                break;
+            p->clock_hand = 0;
+            slots_left = total_slots;
+        }
+
+        // Search until the end of current byte (if clock_hand % 8 != 0)
+        while ((p->clock_hand & 0x7) != 0) {
+            if (clock_get_bit(p->bitmap, p->clock_hand)) {
+                clock_reset_bit(p->bitmap, p->clock_hand);
+            } else {
+                victim_found = 1;
+                break;
+            }
+            p->clock_hand++;
+        }
+        if (victim_found)
+            break;
+
+        // Search in 64bit increments until 0 is found
+        slots_left = total_slots - p->clock_hand - 1;
+        while (slots_left >= 64) {
+            uint64_t* val64 = (uint64_t*)(p->bitmap + (p->clock_hand >> 3));
+            if (*val64 == (uint64_t)-1) {
+                *val64 = 0;
+                p->clock_hand += 64;
+                slots_left -= 64;
+            } else {
+                break;
+            }
+        }
+
+        // Search in byte increments until 0 is found
+        while (slots_left >= 8) {
+            uint8_t* val8 = (uint8_t*)(p->bitmap + (p->clock_hand >> 3));
+            if (*val8 == (uint8_t)-1) {
+                *val8 = 0;
+                p->clock_hand += 8;
+                slots_left -= 8;
+            } else {
+                p->clock_hand += firstzero[*val8];
+                victim_found = 1;
+                break;
+            }
+        }
+        if (victim_found)
+            break;
+    } //while (1)
+
+    item* it = (item*)slabs_get_slot_at_index(p->clock_hand, id);
 
     pthread_mutex_unlock(&slabs_lock);
 
-    return (void*)ret;
+    return it;
 }
 #endif
 

@@ -151,40 +151,24 @@ static size_t item_make_header(const uint8_t nkey, const int flags, const int nb
 }
 
 #ifdef CLHT
-static int evict(const unsigned int id, const unsigned int total_chunks, const uint32_t cur_hv) {
-    if (id == 0)
-        return 0;
-
-    static unsigned long x = 123456789, y = 362436069, z = 521288629; // seeds
+static int item_evict(const unsigned int id, const uint32_t cur_hv) {
     while (1) {
-        // inlined Marsaglia's xorshf rng
-        unsigned long t;
-        x ^= x << 16;
-        x ^= x >> 5;
-        x ^= x << 1;
-
-        t = x;
-        x = y;
-        y = z;
-        z = t ^ x ^ y;
-
-        unsigned long victim = z % total_chunks;
-
-        item* victim_it = slabs_get_slot_at_index(victim, id);
+        item* victim_it = clock_get_victim(id);
         assert(victim_it);
 
-        uint32_t hv = hash(ITEM_key(victim_it), victim_it->nkey);
-        if (hv == cur_hv)
-            continue;
-
         if ((victim_it->it_flags & ITEM_LINKED) != 0) {
-            // Evicted count is approximate since multiple threads can
-            // pick the same item to evict and get here
+            uint32_t hv = hash(ITEM_key(victim_it), victim_it->nkey);
+            if (hv == cur_hv)
+                continue;
+
+            // Evicted count is approximate since multiple threads can pick
+            // the same item to evict and get here (it is unlikely)
 #ifdef HAVE_GCC_ATOMICS
             __sync_fetch_and_add(&itemstats[id].evicted, 1);
 #else
             itemstats[id].evicted++;
 #endif
+
             do_item_unlink(victim_it, hv);
             break;
         }
@@ -249,7 +233,7 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
     // Evict from cache until we manage to allocate
     while (it == NULL) {
         // If eviction fails, out of memory error will be returned
-        if (!evict(id, total_chunks, cur_hv))
+        if (!item_evict(id, cur_hv))
             break;
         it = slabs_alloc(ntotal, id, &total_chunks);
     }
@@ -266,7 +250,11 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
     //assert(it != heads[id]);
 
     /* Refcount is seeded to 1 by slabs_alloc() */
+#ifndef CLHT
     it->next = it->prev = it->h_next = 0;
+#else
+    it->next = it->prev = 0;
+#endif
     /* Items are initially loaded into the HOT_LRU. This is '0' but I want at
      * least a note here. Compiler (hopefully?) optimizes this out.
      */
@@ -371,7 +359,7 @@ static void do_item_unlink_q(item *it) {
     return;
 }
 
-static void item_unlink_q(item *it) {
+CLHT_UNUSED static void item_unlink_q(item *it) {
 #ifndef CLHT
     pthread_mutex_lock(&lru_locks[it->slabs_clsid]);
     do_item_unlink_q(it);
@@ -420,7 +408,7 @@ void do_item_set(item *it, const uint32_t hv) {
     stats.total_items += 1;
     STATS_UNLOCK();
 
-    item_link_q(it);
+    do_item_update(it);
 
     // assoc_replace must go last because that is the synchronization point.
     // Item is freshly allocated, so there is no need for it to be locked before insertion.
@@ -430,7 +418,6 @@ void do_item_set(item *it, const uint32_t hv) {
     item* old_it = assoc_replace(it, hv);
 
     if (old_it) {
-        item_unlink_q(old_it);
         old_it->it_flags &= ~ITEM_LINKED;
 
         STATS_LOCK();
@@ -451,7 +438,7 @@ int do_item_add(item *it, const uint32_t hv) {
     it->time = current_time;
     ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
 
-    item_link_q(it);
+    do_item_update(it);
 
     // assoc_insert must go last because that is the synchronization point.
     // Item is freshly allocated, so there is no need for it to be locked before insertion.
@@ -470,7 +457,6 @@ int do_item_add(item *it, const uint32_t hv) {
         stats.total_items += 1;
         STATS_UNLOCK();
     } else {
-        item_unlink_q(it);
         it->it_flags &= ~ITEM_LINKED;
         refcount_decr(&it->refcount);
 
@@ -506,7 +492,6 @@ void do_item_unlink(item *it, const uint32_t hv) {
     int success = assoc_delete(ITEM_key(it), it->nkey, hv);
 
     if (success) {
-        item_unlink_q(it);
         it->it_flags &= ~ITEM_LINKED;
 
         STATS_LOCK();
@@ -584,8 +569,7 @@ void do_item_update(item *it) {
         }
     }
 #else
-    // TODO: Noop for now because we use random eviction policy, update once
-    //       we change policy to something that requires updates
+    clock_update(it);
 #endif
 }
 

@@ -37,7 +37,8 @@ void slabs_stats(ADD_STAT add_stats, void *c);
 unsigned int slabs_available_chunks(unsigned int id, bool *mem_flag, unsigned int *total_chunks);
 
 #ifdef CLHT
-void* slabs_get_slot_at_index(unsigned int index, unsigned int id);
+void clock_update(item* it);
+item* clock_get_victim(unsigned int id);
 #endif
 
 int start_slab_maintenance_thread(void);
