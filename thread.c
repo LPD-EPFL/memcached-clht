@@ -111,37 +111,6 @@ unsigned short refcount_decr(unsigned short *refcount) {
 #endif
 }
 
-#ifdef CLHT
-/* This is to be used instead of refcount_incr after item_get. Problem with
- * refcount is with deallocation. We cannot atomically check whether refcount is zero
- * and free the item if it is (not without using locks). Instead, we will prevent the
- * refcount to be incremented if it is zero. Then we know for sure that once it has
- * reached zero, it is safe to free the item. Items get allocated with a refcount of one.
- */
-int refcount_acquire(unsigned short* refcount) {
-#ifdef HAVE_GCC_ATOMICS
-    unsigned short old;
-    do {
-        old = *refcount;
-        if (old == 0)
-            return 0;
-    } while (!__sync_bool_compare_and_swap(refcount, old, old+1));
-    return 1;
-#else
-    int ret;
-    mutex_lock(&atomics_mutex);
-    if (*refcount == 0) {
-        ret = 0;
-    } else {
-        (*refcount)++;
-        ret = 1;
-    }
-    mutex_unlock(&atomics_mutex);
-    return ret;
-#endif
-}
-#endif
-
 /* item_lock() must be held for an item before any modifications to either its
  * associated hash bucket, or the structure itself.
  * LRU modifications must hold the item lock, and the LRU lock.
@@ -418,6 +387,7 @@ static void *worker_libevent(void *arg) {
      */
 #ifdef CLHT
     assoc_thread_init(me->thread_index);
+    item_gc_thread_init(me->thread_index);
 #endif
 
     register_thread_initialized();
@@ -553,6 +523,16 @@ item *item_touch(const char *key, size_t nkey, uint32_t exptime) {
     item_unlock(hv);
     return it;
 }
+
+#ifdef CLHT
+void item_release(item* item) {
+    uint32_t hv;
+    hv = hash(ITEM_key(item), item->nkey);
+    item_lock(hv);
+    do_item_release(item);
+    item_unlock(hv);
+}
+#endif
 
 /*
  * Links an item into the LRU and hashtable.

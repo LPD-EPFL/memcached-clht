@@ -295,7 +295,9 @@ static void *do_slabs_alloc(const size_t size, unsigned int id, unsigned int *to
         /* Kill flag and initialize refcount here for lock safety in slab
          * mover's freeness detection. */
         it->it_flags &= ~ITEM_SLABBED;
+#ifndef CLHT
         it->refcount = 1;
+#endif
         p->sl_curr--;
         ret = (void *)it;
     }

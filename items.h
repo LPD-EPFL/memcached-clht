@@ -1,6 +1,11 @@
 /* See items.c */
 uint64_t get_cas_id(void);
 
+#ifdef CLHT
+void item_gc_init(unsigned int size_limit, int num_threads);
+void item_gc_thread_init(int thread_id);
+#endif
+
 /*@null@*/
 item *do_item_alloc(char *key, const size_t nkey, const int flags, const rel_time_t exptime, const int nbytes, const uint32_t cur_hv);
 void item_free(item *it);
@@ -27,6 +32,9 @@ void item_stats_sizes(ADD_STAT add_stats, void *c);
 
 item *do_item_get(const char *key, const size_t nkey, const uint32_t hv);
 item *do_item_touch(const char *key, const size_t nkey, uint32_t exptime, const uint32_t hv);
+#ifdef CLHT
+void do_item_release(item* it);
+#endif
 void item_stats_reset(void);
 extern pthread_mutex_t lru_locks[POWER_LARGEST];
 void item_stats_evictions(uint64_t *evicted);

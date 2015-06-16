@@ -247,6 +247,7 @@ static void settings_init(void) {
     settings.tail_repair_time = TAIL_REPAIR_TIME_DEFAULT;
     settings.flush_enabled = true;
     settings.crawls_persleep = 1000;
+    settings.free_list_size_limit = 0;
 }
 
 /*
@@ -493,14 +494,28 @@ static void conn_release_items(conn *c) {
     assert(c != NULL);
 
     if (c->item) {
+#ifndef CLHT
         item_remove(c->item);
+#else
+        // Can we get here if there is an error and our newly allocated item
+        // is in c->item? Cleanup just in case, but check that the item is
+        // not linked.
+        item* it = (item*)c->item;
+        if ((it->it_flags & ITEM_LINKED) == 0) {
+            item_free(it);
+        }
+#endif
         c->item = 0;
     }
 
     while (c->ileft > 0) {
         item *it = *(c->icurr);
         assert((it->it_flags & ITEM_SLABBED) == 0);
+#ifndef CLHT
         item_remove(it);
+#else
+        item_release(it);
+#endif
         c->icurr++;
         c->ileft--;
     }
@@ -952,7 +967,14 @@ static void complete_nread_ascii(conn *c) {
 
     }
 
+#ifndef CLHT
     item_remove(c->item);       /* release the c->item reference */
+#else
+    // If we failed to store the item, we should free it since we
+    // allocated it and hold the only reference.
+    if (ret == NOT_STORED)
+        item_free(it);
+#endif
     c->item = 0;
 }
 
@@ -1263,7 +1285,14 @@ static void complete_update_bin(conn *c) {
         write_bin_error(c, eno, NULL, 0);
     }
 
+#ifndef CLHT
     item_remove(c->item);       /* release the c->item reference */
+#else
+    // If we failed to store the item, we should free it since we
+    // allocated it and hold the only reference.
+    if (ret == NOT_STORED)
+        item_free(it);
+#endif
     c->item = 0;
 }
 
@@ -1344,8 +1373,15 @@ static void process_bin_get_or_touch(conn *c) {
 
         conn_set_state(c, conn_mwrite);
         c->write_and_go = conn_new_cmd;
+
         /* Remember this command so we can garbage collect it later */
+#ifndef CLHT
         c->item = it;
+#else
+        *(c->ilist) = it;
+        c->icurr = c->ilist;
+        c->ileft = 1;
+#endif
     } else {
         pthread_mutex_lock(&c->thread->stats.mutex);
         if (should_touch) {
@@ -2054,7 +2090,11 @@ static void process_bin_update(conn *c) {
             it = item_get(key, nkey);
             if (it) {
                 item_unlink(it);
+#ifndef CLHT
                 item_remove(it);
+#else
+                item_release(it);
+#endif
             }
         }
 
@@ -2214,7 +2254,11 @@ static void process_bin_delete(conn *c) {
         } else {
             write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_EEXISTS, NULL, 0);
         }
+#ifndef CLHT
         item_remove(it);      /* release our reference */
+#else
+        item_release(it);
+#endif
     } else {
         write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT, NULL, 0);
         pthread_mutex_lock(&c->thread->stats.mutex);
@@ -2271,7 +2315,17 @@ static void reset_cmd_handler(conn *c) {
     c->cmd = -1;
     c->substate = bin_no_state;
     if(c->item != NULL) {
+#ifndef CLHT
         item_remove(c->item);
+#else
+        // Can we get here if there is an error and our newly allocated item
+        // is in c->item? Cleanup just in case, but check that the item is
+        // not linked.
+        item* it = (item*)c->item;
+        if ((it->it_flags & ITEM_LINKED) == 0) {
+            item_free(it);
+        }
+#endif
         c->item = NULL;
     }
     conn_shrink(c);
@@ -2421,7 +2475,11 @@ enum store_item_type do_store_item(item *it, int comm, conn *c, const uint32_t h
     }
 
     if (old_it != NULL)
+#ifndef CLHT
         do_item_remove(old_it);         /* release our reference */
+#else
+        do_item_release(old_it);
+#endif
     if (new_it != NULL)
         do_item_remove(new_it);
 
@@ -2700,6 +2758,7 @@ static void process_stat_settings(ADD_STAT add_stats, void *c) {
     APPEND_STAT("hot_lru_pct", "%d", settings.hot_lru_pct);
     APPEND_STAT("warm_lru_pct", "%d", settings.hot_lru_pct);
     APPEND_STAT("expirezero_does_not_evict", "%s", settings.expirezero_does_not_evict ? "yes" : "no");
+    APPEND_STAT("free_list_size_limit", "%d", settings.free_list_size_limit);
 }
 
 static void conn_to_str(const conn *c, char *buf) {
@@ -2906,7 +2965,11 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
             if(nkey > KEY_MAX_LENGTH) {
                 out_string(c, "CLIENT_ERROR bad command line format");
                 while (i-- > 0) {
+#ifndef CLHT
                     item_remove(*(c->ilist + i));
+#else
+                    item_release(*(c->ilist + i));
+#endif
                 }
                 return;
             }
@@ -2925,7 +2988,11 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                         STATS_LOCK();
                         stats.malloc_fails++;
                         STATS_UNLOCK();
+#ifndef CLHT
                         item_remove(it);
+#else
+                        item_release(it);
+#endif
                         break;
                     }
                 }
@@ -2953,7 +3020,11 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                         STATS_LOCK();
                         stats.malloc_fails++;
                         STATS_UNLOCK();
+#ifndef CLHT
                         item_remove(it);
+#else
+                        item_release(it);
+#endif
                         break;
                     }
                   }
@@ -2964,10 +3035,17 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                       stats.malloc_fails++;
                       STATS_UNLOCK();
                       out_of_memory(c, "SERVER_ERROR out of memory making CAS suffix");
+#ifndef CLHT
                       item_remove(it);
                       while (i-- > 0) {
                           item_remove(*(c->ilist + i));
                       }
+#else
+                      item_release(it);
+                      while (i-- > 0) {
+                          item_release(*(c->ilist + i));
+                      }
+#endif
                       return;
                   }
                   *(c->suffixlist + i) = suffix;
@@ -2980,7 +3058,11 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                       add_iov(c, suffix, suffix_len) != 0 ||
                       add_iov(c, ITEM_data(it), it->nbytes) != 0)
                       {
+#ifndef CLHT
                           item_remove(it);
+#else
+                          item_release(it);
+#endif
                           break;
                       }
                 }
@@ -2992,7 +3074,11 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                       add_iov(c, ITEM_key(it), it->nkey) != 0 ||
                       add_iov(c, ITEM_suffix(it), it->nsuffix + it->nbytes) != 0)
                       {
+#ifndef CLHT
                           item_remove(it);
+#else
+                          item_release(it);
+#endif
                           break;
                       }
                 }
@@ -3136,7 +3222,11 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
             it = item_get(key, nkey);
             if (it) {
                 item_unlink(it);
+#ifndef CLHT
                 item_remove(it);
+#else
+                item_release(it);
+#endif
             }
         }
 
@@ -3183,7 +3273,11 @@ static void process_touch_command(conn *c, token_t *tokens, const size_t ntokens
         pthread_mutex_unlock(&c->thread->stats.mutex);
 
         out_string(c, "TOUCHED");
+#ifndef CLHT
         item_remove(it);
+#else
+        item_release(it);
+#endif
     } else {
         pthread_mutex_lock(&c->thread->stats.mutex);
         c->thread->stats.touch_cmds++;
@@ -3391,7 +3485,11 @@ static void process_delete_command(conn *c, token_t *tokens, const size_t ntoken
         pthread_mutex_unlock(&c->thread->stats.mutex);
 
         item_unlink(it);
+#ifndef CLHT
         item_remove(it);      /* release our reference */
+#else
+        item_release(it);
+#endif
         out_string(c, "DELETED");
     } else {
         pthread_mutex_lock(&c->thread->stats.mutex);
@@ -4866,6 +4964,8 @@ static void usage(void) {
            "                (requires lru_maintainer)\n"
            "              - expirezero_does_not_evict: Items set to not expire, will not evict.\n"
            "                (requires lru_maintainer)\n"
+           "              - free_list_size_limit: Size limit after which we should try to switch\n"
+           "                free lists.\n"
            );
     return;
 }
@@ -5114,7 +5214,8 @@ int main (int argc, char **argv) {
         LRU_MAINTAINER,
         HOT_LRU_PCT,
         WARM_LRU_PCT,
-        NOEXP_NOEVICT
+        NOEXP_NOEVICT,
+        FREE_LIST_LIMIT
     };
     char *const subopts_tokens[] = {
         [MAXCONNS_FAST] = "maxconns_fast",
@@ -5130,6 +5231,7 @@ int main (int argc, char **argv) {
         [HOT_LRU_PCT] = "hot_lru_pct",
         [WARM_LRU_PCT] = "warm_lru_pct",
         [NOEXP_NOEVICT] = "expirezero_does_not_evict",
+        [FREE_LIST_LIMIT] = "free_list_size_limit",
         NULL
     };
 
@@ -5483,6 +5585,13 @@ int main (int argc, char **argv) {
             case NOEXP_NOEVICT:
                 settings.expirezero_does_not_evict = true;
                 break;
+            case FREE_LIST_LIMIT:
+                if (subopts_value == NULL) {
+                    fprintf(stderr, "Missing numeric argument for free list size limit\n");
+                    return 1;
+                }
+                settings.free_list_size_limit = atoi(subopts_value);
+                break;
             default:
                 printf("Illegal suboption \"%s\"\n", subopts_value);
                 return 1;
@@ -5525,6 +5634,11 @@ int main (int argc, char **argv) {
                 exit(EX_USAGE);
             }
         }
+    }
+
+    /* Use a multiple of number of threads as the default value */
+    if (settings.free_list_size_limit <= 0) {
+        settings.free_list_size_limit = settings.num_threads * 8;
     }
 
     if (tcp_specified && !udp_specified) {
@@ -5630,6 +5744,9 @@ int main (int argc, char **argv) {
     assoc_init(settings.hashpower_init);
     conn_init();
     slabs_init(settings.maxbytes, settings.factor, preallocate);
+#ifdef CLHT
+    item_gc_init(settings.free_list_size_limit, settings.num_threads);
+#endif
 
     /*
      * ignore SIGPIPE signals; we can use errno == EPIPE if we

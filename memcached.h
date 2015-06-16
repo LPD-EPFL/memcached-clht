@@ -337,6 +337,7 @@ struct settings {
     int warm_lru_pct; /* percentage of slab space for WARM_LRU */
     int crawls_persleep; /* Number of LRU crawls to run before sleeping */
     bool expirezero_does_not_evict; /* exptime == 0 goes into NOEXP_LRU */
+    int free_list_size_limit; /* size limit after which we should try to switch free lists */
 };
 
 extern struct stats stats;
@@ -593,6 +594,9 @@ int   is_listen_thread(void);
 item *item_alloc(char *key, size_t nkey, int flags, rel_time_t exptime, int nbytes);
 item *item_get(const char *key, const size_t nkey);
 item *item_touch(const char *key, const size_t nkey, uint32_t exptime);
+#ifdef CLHT
+void item_release(item* it);
+#endif
 int   item_link(item *it);
 void  item_remove(item *it);
 int   item_replace(item *it, item *new_it, const uint32_t hv);
@@ -606,9 +610,6 @@ void item_unlock(uint32_t hv);
 void pause_threads(enum pause_thread_types type);
 unsigned short refcount_incr(unsigned short *refcount);
 unsigned short refcount_decr(unsigned short *refcount);
-//#ifdef CLHT
-int refcount_acquire(unsigned short* refcount);
-//#endif
 void STATS_LOCK(void);
 void STATS_UNLOCK(void);
 void threadlocal_stats_reset(void);

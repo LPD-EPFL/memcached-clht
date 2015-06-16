@@ -75,6 +75,131 @@ static pthread_mutex_t lru_crawler_stats_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t lru_maintainer_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t cas_id_lock = PTHREAD_MUTEX_INITIALIZER;
 
+#ifdef CLHT
+// TODO: handle timestamp wraparound
+typedef struct {
+    uint64_t* ts_snapshot;
+    item* head;
+    unsigned int item_count;
+} free_list_t;
+
+static uint64_t* volatile timestamps;
+static __thread uint64_t* my_timestamp;
+#define ITEM_TIMESTAMP ((*my_timestamp)++)
+
+static free_list_t* current_free_list = NULL;
+static free_list_t* last_free_list = NULL;
+static unsigned int free_list_size_limit = 0;
+static int ts_size = 0;
+static pthread_mutex_t free_list_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void item_gc_init(unsigned int size_limit, int num_threads) {
+    free_list_size_limit = size_limit;
+    ts_size = num_threads;
+
+    current_free_list = (free_list_t*) malloc(sizeof(free_list_t));
+    last_free_list = (free_list_t*) malloc(sizeof(free_list_t));
+    if (current_free_list) {
+        memset(current_free_list, 0, sizeof(free_list_t));
+        current_free_list->ts_snapshot = (uint64_t*) malloc(num_threads*sizeof(uint64_t));
+        if (current_free_list->ts_snapshot)
+            memset(current_free_list->ts_snapshot, 0, num_threads*sizeof(uint64_t));
+    }
+    if (last_free_list) {
+        memset(last_free_list, 0, sizeof(free_list_t));
+        last_free_list->ts_snapshot = (uint64_t*) malloc(num_threads*sizeof(uint64_t));
+        if (last_free_list->ts_snapshot)
+            memset(last_free_list->ts_snapshot, 0, num_threads*sizeof(uint64_t));
+    }
+    timestamps = (uint64_t*) malloc(num_threads*sizeof(uint64_t));
+
+    if (!current_free_list || !current_free_list->ts_snapshot ||
+        !last_free_list    || !last_free_list->ts_snapshot    || !timestamps)
+    {
+        fprintf(stderr, "Failed to init item free lists.\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+void item_gc_thread_init(int thread_id) {
+    my_timestamp = &timestamps[thread_id];
+}
+
+static void do_free_list_collect_ts_snapshot() {
+    uint64_t* ts = current_free_list->ts_snapshot;
+    int i;
+    for (i = 0; i < ts_size; i++) {
+        ts[i] = timestamps[i];
+    }
+}
+
+/* It's safe to release the items from the last free list and swap the lists if the
+   timestamp of each thread is either:
+   - even in the last free list (thread wasn't holding an item during last swap)
+   - odd in the last free list, and has a strictly larger value in the current free list
+     (thread was holding an item during last swap, but released it in the meantime)
+ */
+static int do_free_list_safe_to_swap() {
+    uint64_t* last_ts = last_free_list->ts_snapshot;
+    uint64_t* curr_ts = current_free_list->ts_snapshot;
+    int i;
+    for (i = 0; i < ts_size; i++) {
+        if ((last_ts[i] & 1) && (last_ts[i] >= curr_ts[i]))
+            return 0;
+    }
+    return 1;
+}
+
+static void do_free_list_try_to_swap() {
+    do_free_list_collect_ts_snapshot();
+    if (do_free_list_safe_to_swap()) {
+        // release items from last list
+        item* cur_it = last_free_list->head;
+        while (cur_it != NULL) {
+            assert((cur_it->it_flags & ITEM_SLABBED) == 0);
+            assert((cur_it->it_flags & ITEM_LINKED) == 0);
+
+            size_t ntotal = ITEM_ntotal(cur_it);
+            unsigned int clsid = ITEM_clsid(cur_it);
+            item* next_it = cur_it->next;
+            slabs_free(cur_it, ntotal, clsid);
+            
+            cur_it = next_it;
+        }
+
+        last_free_list->head = NULL;
+        last_free_list->item_count = 0;
+
+        // swap list pointers
+        free_list_t* tmp = current_free_list;
+        current_free_list = last_free_list;
+        last_free_list = tmp;
+    }
+}
+
+static void free_list_insert(item* it) {
+    pthread_mutex_lock(&free_list_lock);
+    
+    it->next = current_free_list->head;
+    it->prev = NULL;
+    if (current_free_list->head)
+        current_free_list->head->prev = it;
+    current_free_list->head = it;
+
+    if (++current_free_list->item_count >= free_list_size_limit) {
+        do_free_list_try_to_swap();
+    }
+
+    pthread_mutex_unlock(&free_list_lock);
+}
+
+static void free_list_try_to_release() {
+    pthread_mutex_lock(&free_list_lock);
+    do_free_list_try_to_swap();
+    pthread_mutex_unlock(&free_list_lock);
+}
+#endif
+
 void item_stats_reset(void) {
     int i;
     for (i = 0; i < LARGEST_ID; i++) {
@@ -152,6 +277,7 @@ static size_t item_make_header(const uint8_t nkey, const int flags, const int nb
 
 #ifdef CLHT
 static int item_evict(const unsigned int id, const uint32_t cur_hv) {
+    int tries = 0;
     while (1) {
         item* victim_it = clock_get_victim(id);
         assert(victim_it);
@@ -171,6 +297,11 @@ static int item_evict(const unsigned int id, const uint32_t cur_hv) {
 
             do_item_unlink(victim_it, hv);
             break;
+        } else {
+            if (++tries > 4) {
+                free_list_try_to_release();
+                break;
+            }
         }
     }
     return 1;
@@ -282,17 +413,23 @@ item *do_item_alloc(char *key, const size_t nkey, const int flags,
 }
 
 void item_free(item *it) {
-    size_t ntotal = ITEM_ntotal(it);
-    unsigned int clsid;
+    assert((it->it_flags & ITEM_SLABBED) == 0);
     assert((it->it_flags & ITEM_LINKED) == 0);
+#ifndef CLHT
     assert(it != heads[it->slabs_clsid]);
     assert(it != tails[it->slabs_clsid]);
     assert(it->refcount == 0);
+
+    size_t ntotal = ITEM_ntotal(it);
+    unsigned int clsid;
 
     /* so slab size changer can tell later if item is already free or not */
     clsid = ITEM_clsid(it);
     DEBUG_REFCNT(it, 'F');
     slabs_free(it, ntotal, clsid);
+#else
+    free_list_insert(it);
+#endif
 }
 
 /**
@@ -387,7 +524,9 @@ int do_item_link(item *it, const uint32_t hv) {
     ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
     assoc_insert(it, hv);
     item_link_q(it);
+#ifndef CLHT
     refcount_incr(&it->refcount);
+#endif
 
     return 1;
 }
@@ -395,8 +534,6 @@ int do_item_link(item *it, const uint32_t hv) {
 #ifdef CLHT
 void do_item_set(item *it, const uint32_t hv) {
     assert((it->it_flags & (ITEM_LINKED|ITEM_SLABBED)) == 0);
-
-    refcount_incr(&it->refcount);
 
     it->it_flags |= ITEM_LINKED;
     it->time = current_time;
@@ -425,25 +562,21 @@ void do_item_set(item *it, const uint32_t hv) {
         stats.curr_items -= 1;
         STATS_UNLOCK();
 
-        do_item_remove(old_it);
+        item_free(old_it);
     }
 }
 
 int do_item_add(item *it, const uint32_t hv) {
     assert((it->it_flags & (ITEM_LINKED|ITEM_SLABBED)) == 0);
 
-    refcount_incr(&it->refcount);
-
     it->it_flags |= ITEM_LINKED;
     it->time = current_time;
     ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
 
-    do_item_update(it);
-
     // assoc_insert must go last because that is the synchronization point.
     // Item is freshly allocated, so there is no need for it to be locked before insertion.
     // Since insertion can fail if there are concurrent adds/sets for the same key, we
-    // need to undo changes to item (refcount, flags), so it can be freed by the caller.
+    // need to undo changes to item (e.g. flags), so it can be freed by the caller.
     // cas_id may end up being wasted if the insert fails, but it doesn't matter.
 
     int success = assoc_insert(it, hv);
@@ -451,6 +584,8 @@ int do_item_add(item *it, const uint32_t hv) {
     if (success) {
         // Actually this also needs to be done before insert, and undone if it fails,
         // but for now I don't care
+        do_item_update(it);
+
         STATS_LOCK();
         stats.curr_bytes += ITEM_ntotal(it);
         stats.curr_items += 1;
@@ -458,7 +593,6 @@ int do_item_add(item *it, const uint32_t hv) {
         STATS_UNLOCK();
     } else {
         it->it_flags &= ~ITEM_LINKED;
-        refcount_decr(&it->refcount);
 
         // The protocol says that item should be updated on failed add, but the only way
         // for the add to fail here is if there was a concurrent set/add that was faster,
@@ -485,8 +619,8 @@ void do_item_unlink(item *it, const uint32_t hv) {
 #else
     // assoc_delete must go first because that is the synchronization point.
     // Only a single concurrent delete can succeed.
-    // Item can still be used by other threads (readers), but they either don't touch the
-    // fields changed here (flags) or the fields are atomic (refcount).
+    // Item can still be used by other threads (readers), but they don't touch the
+    // fields changed here (e.g. flags).
     assert((it->it_flags & ITEM_LINKED) != 0);
 
     int success = assoc_delete(ITEM_key(it), it->nkey, hv);
@@ -499,7 +633,7 @@ void do_item_unlink(item *it, const uint32_t hv) {
         stats.curr_items -= 1;
         STATS_UNLOCK();
 
-        do_item_remove(it);
+        item_free(it);
     }
 #endif
 }
@@ -524,6 +658,10 @@ void do_item_unlink_nolock(item *it, const uint32_t hv) {
 }
 
 void do_item_remove(item *it) {
+#ifdef CLHT
+    // Shouldn't  be called in CLHT mode
+    assert(false);
+#endif
     MEMCACHED_ITEM_REMOVE(ITEM_key(it), it->nkey, it->nbytes);
     assert((it->it_flags & ITEM_SLABBED) == 0);
     assert(it->refcount > 0);
@@ -838,20 +976,29 @@ void item_stats_sizes(ADD_STAT add_stats, void *c) {
 
 /** wrapper around assoc_find which does the lazy expiration logic */
 item *do_item_get(const char *key, const size_t nkey, const uint32_t hv) {
-    item *it = assoc_find(key, nkey, hv);
-    if (it != NULL) {
 #ifdef CLHT
-        /* Between getting the item pointer from the hashtable and here,
-           the item can be deleted, its refcount gone to zero, and the item
-           freed. In that case, we consider that get failed to find the 
-           item and return NULL.
-           Also, the item can be allocated again and its refcount above zero
-           again. In that case, we will return the wrong item.
-           TODO: fix this problem.
-         */
-        if (!refcount_acquire(&it->refcount))
-            it = NULL;
-#else
+    /* For every get hit or miss we increase thread timestamp twice. We increase
+     * thread timestamp before trying to find the item. This ensures that the
+     * item won't be freed until we increase the timestamp again when we release
+     * the item. We need to increase on miss because we increase before we do the
+     * hashtable lookup. We need to increase twice because otherwise we wouldn't
+     * have progress in the absence of gets (for 100% write workload).
+     * IMPORTANT: Replacing refcount with this timestamp mechanism means that
+     * ascii get command with multiple keys will not work properly any more.
+     * A thread needs to get an item and transmit it before getting the next item.
+     * Otherwise, all items except the last one can end up garbage collected, freed,
+     * and allocated again before being transmited to the client.
+     */
+    ITEM_TIMESTAMP;
+#endif
+    item *it = assoc_find(key, nkey, hv);
+    if (it == NULL) {
+#ifdef CLHT
+        ITEM_TIMESTAMP;
+#endif
+    } else {
+        assert((it->it_flags & ITEM_SLABBED) == 0);
+#ifndef CLHT
         refcount_incr(&it->refcount);
 #endif
 
@@ -894,6 +1041,7 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv) {
     if (it != NULL) {
 #ifndef CLHT
         // TODO: Include this part back, changes to item need to be atomic
+        //       item_remove should be changed to item_free
         if (is_flushed(it)) {
             do_item_unlink(it, hv);
             do_item_remove(it);
@@ -929,6 +1077,13 @@ item *do_item_touch(const char *key, size_t nkey, uint32_t exptime,
     }
     return it;
 }
+
+#ifdef CLHT
+// To be called after get or touch, once the item is no longer used
+void do_item_release(item* it) {
+    ITEM_TIMESTAMP;
+}
+#endif
 
 /*** LRU MAINTENANCE THREAD ***/
 
