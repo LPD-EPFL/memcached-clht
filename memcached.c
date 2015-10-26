@@ -907,7 +907,7 @@ static void complete_nread_ascii(conn *c) {
 
     item *it = c->item;
     int comm = c->cmd;
-    enum store_item_type ret;
+    enum store_item_type ret = NOT_STORED;
 
     pthread_mutex_lock(&c->thread->stats.mutex);
     c->thread->stats.slab_stats[ITEM_clsid(it)].set_cmds++;
